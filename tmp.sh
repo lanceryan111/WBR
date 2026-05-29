@@ -1,4 +1,156 @@
-curl -s -w "\nHTTP_CODE:%{http_code}\n" \
-  -H "Authorization: Bearer YOUR_API_TOKEN" \
-  -H "Accept: application/json" \
-  "https://<jira-base>/rest/scriptrunner/latest/custom/jigitWrapper/<hardcoded-repo-id>"
+好，认证通了，现在直接上完整的 workflow。
+
+完整的 workflow 文件给你了。用之前需要做三件事：
+
+1. 配置 Secrets 和 Variables
+
+在仓库 Settings → Secrets and variables → Actions 里添加：
+
+	•	Secret: JIRA_API_TOKEN — 你刚测通的那个 PAT
+	•	Variable: JIRA_BASE_URL — https://track.td.com
+
+2. 放到仓库里
+
+把文件放到 .github/workflows/jira-precheck.yml
+
+3. 设置 Branch Protection
+
+Settings → Branches → 主分支的 protection rule → 勾选 “Require status checks to pass” → 搜索并添加 validate-jira。这样验证不过就不能合并。
+
+它做了什么
+
+整个流程分三步：先从 PR 标题提取 JIRA key，再遍历所有 commit message 提取并去重，最后逐个调 track.td.com 的 REST API 验证 ticket 真实存在，200 才算通过，404 直接拦截。
+
+如果 runner 到 track.td.com 不通（内网），把 runs-on 改成 self-hosted。
+
+# .github/workflows/jira-precheck.yml
+# WMPTRADE-32454: CI/CD pre-check to enforce JIRA traceability
+# Validates that PR title and all commits reference a real JIRA ticket
+
+name: JIRA Traceability Pre-check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  validate-jira:
+    runs-on: ubuntu-latest   # 如果 track.td.com 是内网，改成 self-hosted
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 1: 从 PR 标题提取 JIRA key
+      - name: Extract JIRA key from PR title
+        id: extract_pr
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "PR Title: $PR_TITLE"
+
+          KEY=$(echo "$PR_TITLE" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1)
+
+          if [ -z "$KEY" ]; then
+            echo "::error::❌ PR 标题中找不到 JIRA ticket key（例: WMPTRADE-1234）"
+            echo "::error::请在 PR 标题中包含有效的 JIRA ticket key"
+            exit 1
+          fi
+
+          echo "pr_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "✅ 从 PR 标题提取到候选 key: $KEY"
+
+      # Step 2: 从所有 commit message 提取 JIRA keys
+      - name: Extract JIRA keys from commits
+        id: extract_commits
+        run: |
+          echo "检查所有 commit messages..."
+
+          COMMITS=$(git log --format="%H %s" origin/${{ github.base_ref }}..HEAD)
+
+          FAILED=0
+          ALL_KEYS=""
+
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            HASH=$(echo "$line" | cut -d' ' -f1 | cut -c1-8)
+            MSG=$(echo "$line" | cut -d' ' -f2-)
+            KEY=$(echo "$MSG" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1)
+
+            if [ -z "$KEY" ]; then
+              echo "::error::❌ Commit $HASH 缺少 JIRA key: $MSG"
+              FAILED=1
+            else
+              echo "  ✅ $HASH → $KEY"
+              ALL_KEYS="$ALL_KEYS $KEY"
+            fi
+          done <<< "$COMMITS"
+
+          if [ "$FAILED" = "1" ]; then
+            echo "::error::存在不包含 JIRA key 的 commit，请修改 commit message"
+            exit 1
+          fi
+
+          UNIQUE_KEYS=$(echo "${{ steps.extract_pr.outputs.pr_key }} $ALL_KEYS" | tr ' ' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
+          echo "unique_keys=$UNIQUE_KEYS" >> "$GITHUB_OUTPUT"
+          echo "✅ 需要验证的 JIRA tickets: $UNIQUE_KEYS"
+
+      # Step 3: 调 JIRA API 验证每个 ticket 是否真实存在
+      - name: Verify JIRA tickets exist via API
+        env:
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+        run: |
+          KEYS="${{ steps.extract_commits.outputs.unique_keys }}"
+          echo "开始向 JIRA 验证 tickets: $KEYS"
+
+          FAILED=0
+
+          IFS=',' read -ra KEY_ARRAY <<< "$KEYS"
+          for KEY in "${KEY_ARRAY[@]}"; do
+            [ -z "$KEY" ] && continue
+            echo ""
+            echo "--- 验证 $KEY ---"
+
+            HTTP_CODE=$(curl -s -o /tmp/jira_response.json -w "%{http_code}" \
+              -H "Authorization: Bearer $JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=key,status,summary")
+
+            case "$HTTP_CODE" in
+              200)
+                SUMMARY=$(cat /tmp/jira_response.json | jq -r '.fields.summary // "N/A"')
+                STATUS=$(cat /tmp/jira_response.json | jq -r '.fields.status.name // "N/A"')
+                echo "✅ $KEY 存在 | 状态: $STATUS | 标题: $SUMMARY"
+                ;;
+              404)
+                echo "::error::❌ $KEY 在 JIRA 中不存在！请确认 ticket key 是否正确"
+                FAILED=1
+                ;;
+              401)
+                echo "::error::❌ JIRA 认证失败 (401)，请检查 JIRA_API_TOKEN secret"
+                exit 1
+                ;;
+              403)
+                echo "::error::❌ 无权限访问 $KEY (403)，请检查 service account 权限"
+                FAILED=1
+                ;;
+              *)
+                echo "::warning::⚠️ JIRA API 返回非预期状态码 $HTTP_CODE for $KEY"
+                cat /tmp/jira_response.json
+                FAILED=1
+                ;;
+            esac
+          done
+
+          echo ""
+          if [ "$FAILED" = "1" ]; then
+            echo "::error::❌ JIRA ticket 验证失败，PR 不允许合并"
+            exit 1
+          fi
+
+          echo "🎉 所有 JIRA tickets 验证通过！"
+
+
+直接全选复制就行。放到仓库的 .github/workflows/jira-precheck.yml，然后配好 secret (JIRA_API_TOKEN) 和 variable (JIRA_BASE_URL = https://track.td.com)，最后在 branch protection 里把 validate-jira 设为必需 status check。
