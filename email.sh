@@ -1,22 +1,29 @@
-Hi Marcin,
+Subject: Quick question on CMOB runner capacity for AT pipeline setup
 
-Collected a few more details that may impact the estimate.
+Hi Alex,
 
-1. AT repo is already in TD Universe — release code will be manually SCP’d from DevX.
-2. There’s no existing AT mobile pipeline to reuse, so we’d need to build a dedicated mobile CI pipeline.
-3. Apple signing (Developer Portal / certs / P12) is currently under CMOB ownership, so moving off CMOB would introduce additional setup and coordination.
+Hope you’ve been doing well.
 
-One additional consideration — mobile CI setup is quite different from a typical backend service pipeline. Besides CI orchestration itself, it also involves:
+I’ve recently started helping with an Active Trader mobile pipeline setup request on the new team. The current direction is to reuse CMOB runners first instead of standing up dedicated CI infrastructure.
 
-* macOS runner provisioning and machine lifecycle management
-* Apple signing / certificates / provisioning profile management
-* Mobile-specific build toolchains and environment dependencies (Xcode, Android SDK, Fastlane, etc.)
+I’ve already submitted the intake request, but I heard CMOB may already be close to / out of capacity, so I wanted to check with you:
 
-Because of these environment dependencies, the setup effort is usually more infrastructure-heavy than standard service CI.
+* Which runner pools would realistically be available for us to leverage?
+* Are there any current capacity limits, onboarding requirements, or usage restrictions we should be aware of?
+* Anything we should consider upfront to avoid rework later?
 
-Based on this:
+At this stage we’re only targeting runner onboarding / initial pipeline enablement (not expanding scope into broader CI changes yet).
 
-• If we configure and host the AT Macs → ~4 weeks
-• If we leverage CMOB runners → ~1–2 weeks for pipeline implementation
+Appreciate any guidance when you have a chance — thanks again.
 
-Given the timeline pressure, using CMOB runners feels like the faster option for now. Happy to discuss tomorrow.
+Best,
+Fei
+
+——
+
+这个版本会显得你：
+
+1. 尊重现有流程（已经 submit intake）
+2. 利用旧团队 connection，但不是直接要资源
+3. 没有暴露“CMOB 因为我走了缺人”那句（建议不要写）
+4. 和你新经理刚强调的 runner first / one step at a time 保持一致。
