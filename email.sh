@@ -1,23 +1,28 @@
-Subject: Re: Request CMOB MacOS runners for AT pipeline setup
+这个邮件建议语气偏 status update + unblock next step，不要像宣布完成任务，也顺带把 usage restriction 留档。
 
-Hi @Su, Haifeng,
+Hi all,
 
-First of all, thank you and the team for the quick support and for granting the repo access — really appreciate it.
+Quick update on the CI/CD setup for Active Trader Mobile.
 
-I also wanted to follow up on the software requirements you shared. As we prepare the runner onboarding, could you help confirm if there are any dependencies or tooling that are currently not available on the CMOB runner images and would require us to create new Ansible roles / automation to provision?
+The runner setup has now been completed, and I’ve also aligned with the CMOB team to confirm that the software requirements raised by AT are supported in the current environment.
 
-We’ll review against the current baseline, but if there are any known gaps already identified (SDKs, build tools, package managers, repository access, environment configs, etc.), it would help us plan upfront and avoid rework later.
+At this point, the team should be unblocked to continue working on the build scripts and pipeline implementation.
 
-Thanks again for the support — looking forward to getting this moving.
+As discussed with CMOB, please keep the following usage considerations in mind:
+
+* Capacity on the shared Mac runner pool is currently limited, so please coordinate build usage and prioritize off-hours where possible.
+* AT-specific secret management remains under AT ownership (Vault is currently not scoped for AT).
+* Any additional environment gaps may require AT-owned configuration and supporting automation as needed.
+* Code signing will continue to follow the existing signing service process coordinated with the CMOB team.
+
+Please let me know if any additional environment dependencies are identified during build implementation and we can review together.
 
 Thanks,
 Fei
 
-——
+这个版本的潜台词是：
 
-这个版本语气是：
-
-* 先感谢 support + repo access
-* 不直接让对方列全清单（压力小）
-* 引导他们指出 gap → 你们负责做 Ansible role
-* 显示你已经在按平台化思路推进。
+* runner ready（不是我来写 build script）
+* software requirements checked
+* team can proceed
+* usage restriction 是 agreed dependency，不是你负责兜底
