@@ -1,29 +1,23 @@
-Subject: Quick question on CMOB runner capacity for AT pipeline setup
+Subject: Re: Request CMOB MacOS runners for AT pipeline setup
 
-Hi Alex,
+Hi @Su, Haifeng,
 
-Hope you’ve been doing well.
+First of all, thank you and the team for the quick support and for granting the repo access — really appreciate it.
 
-I’ve recently started helping with an Active Trader mobile pipeline setup request on the new team. The current direction is to reuse CMOB runners first instead of standing up dedicated CI infrastructure.
+I also wanted to follow up on the software requirements you shared. As we prepare the runner onboarding, could you help confirm if there are any dependencies or tooling that are currently not available on the CMOB runner images and would require us to create new Ansible roles / automation to provision?
 
-I’ve already submitted the intake request, but I heard CMOB may already be close to / out of capacity, so I wanted to check with you:
+We’ll review against the current baseline, but if there are any known gaps already identified (SDKs, build tools, package managers, repository access, environment configs, etc.), it would help us plan upfront and avoid rework later.
 
-* Which runner pools would realistically be available for us to leverage?
-* Are there any current capacity limits, onboarding requirements, or usage restrictions we should be aware of?
-* Anything we should consider upfront to avoid rework later?
+Thanks again for the support — looking forward to getting this moving.
 
-At this stage we’re only targeting runner onboarding / initial pipeline enablement (not expanding scope into broader CI changes yet).
-
-Appreciate any guidance when you have a chance — thanks again.
-
-Best,
+Thanks,
 Fei
 
 ——
 
-这个版本会显得你：
+这个版本语气是：
 
-1. 尊重现有流程（已经 submit intake）
-2. 利用旧团队 connection，但不是直接要资源
-3. 没有暴露“CMOB 因为我走了缺人”那句（建议不要写）
-4. 和你新经理刚强调的 runner first / one step at a time 保持一致。
+* 先感谢 support + repo access
+* 不直接让对方列全清单（压力小）
+* 引导他们指出 gap → 你们负责做 Ansible role
+* 显示你已经在按平台化思路推进。
