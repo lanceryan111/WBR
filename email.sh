@@ -1,28 +1,27 @@
-这个邮件建议语气偏 status update + unblock next step，不要像宣布完成任务，也顺带把 usage restriction 留档。
+Subject: Re: Active Trader Mobile Build Stakeholder Re-Alignment
 
-Hi all,
+Hi Marcin,
 
-Quick update on the CI/CD setup for Active Trader Mobile.
+Thanks for the guidance.
 
-The runner setup has now been completed, and I’ve also aligned with the CMOB team to confirm that the software requirements raised by AT are supported in the current environment.
+I’ll align the branch strategy design with our existing WebBroker standards and use that as the baseline for AT. Given the nature of a mobile project (e.g. release cadence, platform-specific build/signing requirements, and app delivery workflow), I’ll make appropriate adjustments where needed while keeping the overall approach consistent with our standards.
 
-At this point, the team should be unblocked to continue working on the build scripts and pipeline implementation.
-
-As discussed with CMOB, please keep the following usage considerations in mind:
-
-* Capacity on the shared Mac runner pool is currently limited, so please coordinate build usage and prioritize off-hours where possible.
-* AT-specific secret management remains under AT ownership (Vault is currently not scoped for AT).
-* Any additional environment gaps may require AT-owned configuration and supporting automation as needed.
-* Code signing will continue to follow the existing signing service process coordinated with the CMOB team.
-
-Please let me know if any additional environment dependencies are identified during build implementation and we can review together.
+I’ll also connect with Chen to understand the current WBR setup and make sure the proposed strategy fits AT’s delivery model.
 
 Thanks,
 Fei
 
-这个版本的潜台词是：
+——
 
-* runner ready（不是我来写 build script）
-* software requirements checked
-* team can proceed
-* usage restriction 是 agreed dependency，不是你负责兜底
+如果想再短一点（更像内部邮件）：
+
+Hi Marcin,
+
+Sounds good — I’ll follow our WebBroker branching standards as the baseline and design a branch strategy that fits AT.
+
+Given the specifics of mobile delivery workflows, I’ll make reasonable adjustments where needed while keeping alignment with the overall standard.
+
+I’ll reach out to Chen to understand the current WBR approach and incorporate the relevant practices.
+
+Thanks,
+Fei
