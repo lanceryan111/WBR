@@ -1,0 +1,43 @@
+name: Release Build
+
+# Reusable workflow invoked by branch-build.yml for releases/** branches.
+on:
+  workflow_call:
+    inputs:
+      disable_build_cache:
+        description: Disables gradle and build cache
+        type: boolean
+        default: false
+      artifact_suffix:
+        description: Suffix appended to produced artifacts
+        type: string
+        default: ""
+      target_branch:
+        description: Branch being built
+        type: string
+        required: true
+
+jobs:
+  build:
+    name: Release Build
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    steps:
+      - name: Configure Additional Gradle Params
+        shell: bash
+        run: |
+          ADDITIONAL_PARAMS="-Ptd.artifactIdSuffix=${{ inputs.artifact_suffix }}"
+          # Release branches build with release flag on.
+          ADDITIONAL_PARAMS="$ADDITIONAL_PARAMS -Ptd.release=true"
+          if [[ "${{ inputs.disable_build_cache }}" == "true" ]]; then
+            ADDITIONAL_PARAMS="$ADDITIONAL_PARAMS --no-build-cache --stacktrace"
+          fi
+          echo "ADDITIONAL_PARAMS=$ADDITIONAL_PARAMS" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_branch }}
+
+      # TODO: add release-specific build steps here
