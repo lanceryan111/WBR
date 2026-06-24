@@ -1,0 +1,152 @@
+name: Build Branch
+
+on:
+  push:
+    branches:
+      - 'develop'
+      - 'master'
+      - 'releases/**'
+      - 'feature/**'
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize # Rebuilds on commits
+  workflow_dispatch:
+    inputs:
+      disable_build_cache:
+        description: Disables gradle and build cache
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+  pull-requests: write
+  issues: write # DangerBot checks for issues
+  statuses: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # init: shared pre-processing for ALL branch types.
+  # Sanitizes inputs, derives branch metadata, exposes them as outputs so the
+  # downstream build jobs can consume them via needs.init.outputs.*
+  # ---------------------------------------------------------------------------
+  init:
+    name: Init
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    outputs:
+      # Sanitized control flags
+      debug: ${{ steps.sanitize-inputs.outputs.debug }}
+      disable_cache: ${{ steps.sanitize-inputs.outputs.disable_cache }}
+      # Branch classification
+      branch_name: ${{ steps.branch-vars.outputs.branch_name }}
+      build_type: ${{ steps.branch-vars.outputs.build_type }}
+      is_release: ${{ steps.branch-vars.outputs.is_release }}
+      artifact_suffix: ${{ steps.branch-vars.outputs.artifact_suffix }}
+    steps:
+      - name: Sanitize Input Variables
+        id: sanitize-inputs
+        shell: bash
+        run: |
+          if [[ -z "${{ runner.debug }}" ]]; then
+            echo "debug=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "debug=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "${{ inputs.disable_build_cache }}" == "true" ]]; then
+            echo "disable_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "disable_cache=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Branch Variables
+        id: branch-vars
+        shell: bash
+        run: |
+          BRANCH_NAME=${{ github.head_ref || github.ref_name }}
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+          # Classify the branch into a single build_type that downstream jobs gate on.
+          if [[ "$BRANCH_NAME" == releases/* ]]; then
+            BUILD_TYPE="release"
+            IS_RELEASE="true"
+          elif [[ "$BRANCH_NAME" == "master" ]]; then
+            BUILD_TYPE="master"
+            IS_RELEASE="false"
+          elif [[ "$BRANCH_NAME" == "develop" ]]; then
+            BUILD_TYPE="develop"
+            IS_RELEASE="false"
+          else
+            BUILD_TYPE="develop" # default fallback for feature/PR branches
+            IS_RELEASE="false"
+          fi
+
+          # Suffix appended to produced artifacts (e.g. M13 from releases/M/M13)
+          if [[ "$BUILD_TYPE" == "release" ]]; then
+            ARTIFACT_SUFFIX="$(echo "$BRANCH_NAME" | cut -d/ -f 3)"
+          else
+            ARTIFACT_SUFFIX=""
+          fi
+
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "artifact_suffix=$ARTIFACT_SUFFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Retrieve secrets from Vault
+        uses: TD-Universe/common-actions/cpb-vault-action@v1
+        with:
+          secrets: |
+            ci-credentials/data/keychainCredentials keychainPass | KEYCHAIN_PASS;
+            ci-credentials/data/bitbucket PXPCI001BITBC | BB_PW;
+            ci-credentials/data/TDUniverseNPIDPersonalAccessToken PXPCI001BITBC | NPID_TOK;
+
+  # ---------------------------------------------------------------------------
+  # develop build — runs only for develop / feature / PR branches
+  # ---------------------------------------------------------------------------
+  develop-build:
+    name: Develop Build
+    needs: [init]
+    if: ${{ needs.init.outputs.build_type == 'develop' }}
+    uses: ./.github/workflows/develop-build.yml
+    secrets: inherit
+    with:
+      disable_build_cache: ${{ needs.init.outputs.disable_cache == 'true' }}
+      artifact_suffix: ${{ needs.init.outputs.artifact_suffix }}
+      target_branch: ${{ needs.init.outputs.branch_name }}
+
+  # ---------------------------------------------------------------------------
+  # master build
+  # ---------------------------------------------------------------------------
+  master-build:
+    name: Master Build
+    needs: [init]
+    if: ${{ needs.init.outputs.build_type == 'master' }}
+    uses: ./.github/workflows/master-build.yml
+    secrets: inherit
+    with:
+      disable_build_cache: ${{ needs.init.outputs.disable_cache == 'true' }}
+      artifact_suffix: ${{ needs.init.outputs.artifact_suffix }}
+      target_branch: ${{ needs.init.outputs.branch_name }}
+
+  # ---------------------------------------------------------------------------
+  # release build
+  # ---------------------------------------------------------------------------
+  release-build:
+    name: Release Build
+    needs: [init]
+    if: ${{ needs.init.outputs.build_type == 'release' }}
+    uses: ./.github/workflows/release-build.yml
+    secrets: inherit
+    with:
+      disable_build_cache: ${{ needs.init.outputs.disable_cache == 'true' }}
+      artifact_suffix: ${{ needs.init.outputs.artifact_suffix }}
+      target_branch: ${{ needs.init.outputs.branch_name }}
