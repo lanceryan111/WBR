@@ -1,0 +1,60 @@
+```yaml
+name: Re-sign
+description: Re-signs a mobile artifact (Android .apk/.aab or iOS .ipa) for pat or prod environments
+
+inputs:
+  artifact_path:
+    description: Path to the artifact to be re-signed
+    required: true
+  environment:
+    description: Prod or Pat artifact
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Process inputs
+      shell: bash
+      run: |
+        filename="${artifact_path##*/}"
+        echo "FILE_NAME=${filename}" >> $GITHUB_ENV
+        echo "FILE_NAME=${filename}" >> $GITHUB_STEP_SUMMARY
+        echo "Environment: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+      env:
+        artifact_path: ${{ inputs.artifact_path }}
+
+    - name: Retrieve secrets from Vault
+      uses: TD-Universe/common-actions/cpb-vault-action@v1
+      with:
+        secrets: |
+          ci-credentials/data/keychainCredentials  keychainPass | KEYCHAIN_PASS;
+
+    - name: Re-sign Android
+      if: contains(env.FILE_NAME, '.apk') || contains(env.FILE_NAME, '.aab')
+      shell: bash
+      env:
+        environmentSelection: ${{ inputs.environment }}
+        binary: ${{ inputs.artifact_path }}
+      run: |
+        ./gradlew -PandroidCertificate="MERCHANT" -PbinaryPath="${{ inputs.artifact_path }}" generateGAV signArtifact publish --stacktrace
+        echo "Re-signed SHA: $(shasum -a 256 resigned.*)" >> $GITHUB_STEP_SUMMARY
+
+    - name: Re-sign iOS
+      if: contains(env.FILE_NAME, '.ipa')
+      shell: bash
+      env:
+        environmentSelection: ${{ inputs.environment }}
+        binary: ${{ inputs.artifact_path }}
+      run: |
+        if [ "${environmentSelection}" == "prod" ]; then
+          provisioningProfile="TD Active Trader"
+        else
+          provisioningProfile="Enterprise TD Investing"
+        fi
+
+        security unlock-keychain -p '${{ env.KEYCHAIN_PASS }}' $HOME/Library/Keychains/login.keychain-db
+        bundle install --path vendor/bundle
+        bundle exec fastlane resign_ipa_simple ipa_path:"${binary}" provisioning_profile:"${provisioningProfile}"
+        ./gradlew publish -PbinaryPath="${binary}" --stacktrace
+        echo "Re-signed SHA: $(shasum -a 256 ${{ inputs.artifact_path }})" >> $GITHUB_STEP_SUMMARY
+```
