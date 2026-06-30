@@ -152,5 +152,9 @@ jobs:
 
           echo "🎉 所有 JIRA tickets 验证通过！"
 
+https://www.friendsofpresquile.on.ca/photos/custom/pdf%20Files/Self%20Use%20Resources/Birdwatching%20Bingo.pdf
+https://www.friendsofpresquile.on.ca/photos/custom/pdf%20Files/Self%20Use%20Resources/Forest%20Scavenger%20Hunt%20-%20Junior.pdf
+https://www.friendsofpresquile.on.ca/photos/custom/pdf%20Files/Self%20Use%20Resources/Common%20Birds%20of%20Presqu'ile%20-%20Summer.pdf
+
 
 直接全选复制就行。放到仓库的 .github/workflows/jira-precheck.yml，然后配好 secret (JIRA_API_TOKEN) 和 variable (JIRA_BASE_URL = https://track.td.com)，最后在 branch protection 里把 validate-jira 设为必需 status check。
