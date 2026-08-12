@@ -1,0 +1,594 @@
+可以。我建议直接整理成一份适合放 GitHub 的技术笔记，重点围绕你现在实际环境里的 App Server / Config Server / JKS / cacerts / PEM / mTLS，并把容易混淆的地方单独说明。
+
+Spring Config Server TLS / Certificate Architecture
+
+1. Overview
+
+The application server communicates with an existing Spring Config Server over HTTPS using mutual TLS (mTLS).
+
+The application server also exposes its own HTTPS API endpoint.
+
+Therefore, the application participates in two different TLS relationships:
+
+                         App Server
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+              ▼                             ▼
+       Config Server mTLS              App API HTTPS
+       (App = Client)                  (App = Server)
+              │                             │
+              ▼                             ▼
+        Config Server                  API Consumers
+
+These two TLS relationships use certificates for different purposes.
+
+⸻
+
+2. Files on the App Server
+
+Example:
+
+/app/webAS/config/ssl/
+├── cacerts
+├── webbroker.delta.td.com.jks
+├── wtinv-api.dev.td.com.crt.pem
+└── wtinv-api.dev.td.com.key.pem
+
+Conceptually:
+
+App Server
+│
+├── webbroker.delta.td.com.jks
+│      └── Client identity used for Config Server mTLS
+│
+├── cacerts
+│      └── Trusted CA certificates
+│
+├── wtinv-api.dev.td.com.crt.pem
+│      └── App API server certificate
+│
+└── wtinv-api.dev.td.com.key.pem
+       └── Private key for App API server certificate
+
+⸻
+
+3. JKS — App Identity for Config Server
+
+Example:
+
+webbroker.delta.td.com.jks
+
+JKS stands for Java KeyStore.
+
+The JKS used as a keystore normally contains a PrivateKeyEntry:
+
+webbroker.delta.td.com.jks
+│
+└── PrivateKeyEntry
+      │
+      ├── Client Certificate
+      │
+      ├── Private Key
+      │
+      └── Certificate Chain
+            ├── Intermediate CA
+            └── Root CA
+
+The important concept is:
+
+Keystore = "Who am I?"
+
+When the App Server connects to the Config Server using mTLS, it uses the certificate and private key stored in this JKS to prove its identity.
+
+The Spring configuration may look like:
+
+spring.cloud.config.tls.enabled=true
+spring.cloud.config.tls.key-store=${server.ssl.key-store}
+spring.cloud.config.tls.key-store-type=${server.ssl.key-store-type}
+spring.cloud.config.tls.key-store-password=${server.ssl.key-store-password}
+spring.cloud.config.tls.key-password=${server.ssl.key-password}
+
+The keystore can therefore be used by the Spring Config Client during the TLS handshake.
+
+⸻
+
+4. cacerts — Truststore
+
+Example:
+
+/app/webAS/config/ssl/cacerts
+
+The truststore contains certificates representing Certificate Authorities that the application trusts.
+
+For example:
+
+cacerts
+│
+├── Corporate Root CA
+├── Corporate Intermediate CA
+├── Other Trusted Root CA
+└── Other Trusted Intermediate CA
+
+The important concept is:
+
+Truststore = "Who do I trust?"
+
+When the Config Server sends its server certificate, the App Server verifies the certificate against the trusted CAs in cacerts.
+
+The Spring configuration may look like:
+
+spring.cloud.config.tls.trust-store=file:/app/webAS/config/ssl/cacerts
+spring.cloud.config.tls.trust-store-type=jks
+spring.cloud.config.tls.trust-store-password=${SPRING_TLS_TRUSTSTORE_PASSWORD}
+
+⸻
+
+5. Config Server Certificate Validation
+
+Suppose the application connects to:
+
+https://webbroker.config.pat.td.com:19988
+
+The Config Server has its own server certificate:
+
+Config Server Certificate
+│
+├── Subject / SAN
+│      └── webbroker.config.pat.td.com
+│
+├── Public Key
+│
+├── Issuer
+│      └── Corporate Intermediate CA
+│
+└── Validity
+
+During the TLS handshake, the Config Server sends this certificate to the App Server.
+
+The App Server then validates it:
+
+Config Server Certificate
+          │
+          │ Issued by
+          ▼
+Corporate Intermediate CA
+          │
+          │ Issued by
+          ▼
+Corporate Root CA
+          │
+          ▼
+ App Server cacerts
+          │
+          └── Trusted
+
+The App Server normally does not need the Config Server leaf certificate directly in cacerts.
+
+It normally needs to trust the CA that issued the Config Server certificate.
+
+⸻
+
+6. Client Certificate Validation
+
+Because the Config Server requires mTLS, authentication also happens in the opposite direction.
+
+The Config Server asks the application:
+
+"Who are you?"
+
+The App Server responds using the client certificate stored in its JKS.
+
+App Server
+    │
+    │ Client Certificate
+    │ + proof of Private Key
+    ▼
+Config Server
+    │
+    │ Validate certificate
+    ▼
+Trusted Client
+
+Therefore:
+
+App JKS
+   │
+   └── Proves App identity
+             │
+             ▼
+       Config Server
+App cacerts
+   │
+   └── Validates Config Server identity
+
+⸻
+
+7. Complete mTLS Handshake
+
+The complete flow looks like this:
+
+App Server                               Config Server
+    │                                         │
+    │ ----------- Client Hello -------------> │
+    │                                         │
+    │ <--------- Server Certificate --------- │
+    │                                         │
+    │ Validate Config Server certificate      │
+    │ using App truststore (cacerts)          │
+    │                                         │
+    │                 OK                      │
+    │                                         │
+    │ <------- Request Client Certificate --- │
+    │                                         │
+    │ Read client identity from JKS           │
+    │                                         │
+    │ -------- Client Certificate ----------> │
+    │ -------- Private Key Proof -----------> │
+    │                                         │
+    │                           Validate App   │
+    │                           Certificate   │
+    │                                │        │
+    │                                OK       │
+    │                                         │
+    │ ========== mTLS Established =========== │
+    │                                         │
+    │ ------ Request Spring Config ---------> │
+    │                                         │
+    │ <---------- Configuration ------------- │
+
+Both sides therefore authenticate each other.
+
+⸻
+
+8. PEM Certificate and Private Key
+
+The App Server also contains:
+
+wtinv-api.dev.td.com.crt.pem
+wtinv-api.dev.td.com.key.pem
+
+These are used when the application itself acts as an HTTPS server.
+
+API Consumer
+     │
+     │ HTTPS
+     ▼
+WTINV App Server
+     │
+     ├── wtinv-api.dev.td.com.crt.pem
+     └── wtinv-api.dev.td.com.key.pem
+
+The two files have different purposes:
+
+.crt.pem
+   │
+   └── Public Certificate
+       "I am wtinv-api.dev.td.com"
+.key.pem
+   │
+   └── Private Key
+       Proves ownership of the certificate
+
+The private key must remain secret.
+
+⸻
+
+9. Why Does the App Need Both JKS and PEM Files?
+
+Because the application has two different TLS roles.
+
+                         App Server
+                             │
+          ┌──────────────────┴──────────────────┐
+          │                                     │
+          ▼                                     ▼
+     TLS Client                             TLS Server
+          │                                     │
+          │                                     │
+Connect to Config Server                Serve App API
+          │                                     │
+          ▼                                     ▼
+        JKS                              CRT.PEM + KEY.PEM
+          │                                     │
+ Client Certificate                     Server Certificate
+ + Private Key                           + Private Key
+
+For the Config Server connection:
+
+App Server = Client
+Config Server = Server
+
+For the App API:
+
+API Consumer = Client
+App Server    = Server
+
+Therefore, these certificates serve different purposes.
+
+⸻
+
+10. Keystore Password vs Key Password
+
+These are two different concepts.
+
+A JKS may look like:
+
+app.jks
+│
+│  Protected by:
+│  KEYSTORE PASSWORD
+│
+└── PrivateKeyEntry
+      │
+      ├── Certificate
+      │
+      └── Private Key
+             │
+             └── Protected by:
+                 KEY PASSWORD
+
+Therefore:
+
+KEYSTORE PASSWORD
+        │
+        └── Opens/accesses the keystore
+KEY PASSWORD
+        │
+        └── Accesses the private key
+
+They can have different values.
+
+However, many Java applications configure them with the same value for simplicity.
+
+For example:
+
+SERVER_SSL_KEY_STORE_PASSWORD = password-A
+SERVER_SSL_KEY_PASSWORD       = password-A
+
+Conceptually they are still different passwords.
+
+⸻
+
+11. Truststore Password
+
+The truststore has its own password:
+
+cacerts
+│
+│  TRUSTSTORE PASSWORD
+│
+├── Root CA
+├── Intermediate CA
+└── Other Trusted CA
+
+For example:
+
+SPRING_TLS_TRUSTSTORE_PASSWORD
+
+This password protects access to the truststore.
+
+It is unrelated to the private-key password.
+
+⸻
+
+12. New Client Certificate Onboarding
+
+If a new application needs to connect to the existing Config Server using mTLS, it needs a client certificate.
+
+Conceptually:
+
+Generate Private Key
+        │
+        ▼
+Generate CSR
+        │
+        ▼
+Submit CSR to Corporate CA
+        │
+        ▼
+CA Issues Client Certificate
+        │
+        ▼
+Client Certificate
++
+Private Key
++
+Certificate Chain
+        │
+        ▼
+Create PKCS12 / JKS
+        │
+        ▼
+App Client Keystore
+        │
+        ▼
+Deploy to App Server
+        │
+        ▼
+Spring Config Client
+        │
+        ▼
+Config Server mTLS
+
+The important point is that the newly requested “Config certificate” may actually mean:
+
+Certificate used by the application
+to authenticate to the Config Server
+
+It is therefore a client certificate, not the Config Server’s own server certificate.
+
+⸻
+
+13. Creating a JKS from Certificate + Private Key
+
+Suppose the certificate onboarding process provides:
+
+client.crt
+client.key
+intermediate.crt
+
+First create a PKCS#12 keystore:
+
+openssl pkcs12 -export \
+  -inkey client.key \
+  -in client.crt \
+  -certfile intermediate.crt \
+  -name app-client \
+  -out app-client.p12
+
+Then convert it to JKS if JKS is required:
+
+keytool -importkeystore \
+  -srckeystore app-client.p12 \
+  -srcstoretype PKCS12 \
+  -destkeystore app-client.jks \
+  -deststoretype JKS
+
+The result should contain:
+
+app-client.jks
+│
+└── PrivateKeyEntry
+      ├── Client Certificate
+      ├── Private Key
+      └── Certificate Chain
+
+⸻
+
+14. Inspecting a JKS
+
+Use:
+
+keytool -list -v \
+  -keystore webbroker.delta.td.com.jks
+
+Important fields include:
+
+Keystore type
+Alias name
+Entry type
+Owner
+Issuer
+Serial number
+Valid from
+SubjectAlternativeName
+ExtendedKeyUsage
+
+For a client keystore, the important result is:
+
+Entry type: PrivateKeyEntry
+
+This means the entry contains a private key in addition to the certificate.
+
+A result such as:
+
+Entry type: trustedCertEntry
+
+means it contains only a trusted certificate and no associated private key.
+
+⸻
+
+15. Inspecting a PEM Certificate
+
+Use:
+
+openssl x509 \
+  -in wtinv-api.dev.td.com.crt.pem \
+  -noout \
+  -subject \
+  -issuer \
+  -serial \
+  -dates
+
+For more detail:
+
+openssl x509 \
+  -in wtinv-api.dev.td.com.crt.pem \
+  -text \
+  -noout
+
+Useful fields include:
+
+Subject
+Issuer
+Validity
+Subject Alternative Name
+Extended Key Usage
+
+Extended Key Usage can help identify the intended certificate purpose.
+
+For example:
+
+TLS Web Server Authentication
+
+means:
+
+serverAuth
+
+while:
+
+TLS Web Client Authentication
+
+means:
+
+clientAuth
+
+A certificate may also support both.
+
+⸻
+
+16. Quick Reference
+
+App Server
+│
+├── Client Keystore (.jks)
+│      │
+│      ├── Client Certificate
+│      └── Private Key
+│
+│      Purpose:
+│      Prove App identity to Config Server
+│
+├── Truststore (cacerts)
+│      │
+│      └── Trusted CA Certificates
+│
+│      Purpose:
+│      Verify Config Server certificate
+│
+└── API HTTPS Certificate
+       │
+       ├── app.crt.pem
+       └── app.key.pem
+       Purpose:
+       Prove App identity to API consumers
+
+The easiest way to remember the architecture is:
+
+Keystore
+   =
+Who am I?
+Truststore
+   =
+Who do I trust?
+CRT
+   =
+Certificate / public identity
+Private Key
+   =
+Proof that I own that identity
+
+And for this architecture:
+
+                Config Server Connection
+App JKS ---------------------------------> Config Server
+"Here is my client identity"
+App cacerts <----------------------------- Config Server
+"I trust the CA that issued your identity"
+                    App API
+API Consumer ----------------------------> App
+                                           │
+                                           ├── CRT.PEM
+                                           └── KEY.PEM
+                                           "Here is my server identity"
