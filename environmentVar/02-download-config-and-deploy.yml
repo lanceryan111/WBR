@@ -1,0 +1,273 @@
+name: Download config from Nexus and deploy scripts
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Target environment and environment-specific config file"
+        required: true
+        type: choice
+        options:
+          - dev
+          - pat
+          - prod
+      config_version:
+        description: "Immutable config version published by workflow 01"
+        required: true
+        type: string
+      inventory_path:
+        description: "Ansible inventory path"
+        required: true
+        default: "wbr_actions/ansible/inventory"
+        type: string
+      playbook_path:
+        description: "Ansible deployment playbook path"
+        required: true
+        default: "wbr_actions/ansible/deploy.yml"
+        type: string
+      deploy_tags:
+        description: "Tags that execute deploy_scripts.yml"
+        required: true
+        default: "deploy_app_scripts"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.target_environment }}-fraud-detection-fraudster
+  cancel-in-progress: false
+
+env:
+  APPLICATION: fraud-detection-fraudster
+  TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+  CONFIG_VERSION: ${{ inputs.config_version }}
+  INVENTORY_PATH: ${{ inputs.inventory_path }}
+  PLAYBOOK_PATH: ${{ inputs.playbook_path }}
+  DEPLOY_TAGS: ${{ inputs.deploy_tags }}
+  NEXUS_BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+  NEXUS_REPOSITORY: ${{ vars.NEXUS_CONFIG_REPOSITORY }}
+  ANSIBLE_LIMIT_DEV: ${{ vars.ANSIBLE_LIMIT_DEV }}
+  ANSIBLE_LIMIT_PAT: ${{ vars.ANSIBLE_LIMIT_PAT }}
+  ANSIBLE_LIMIT_PROD: ${{ vars.ANSIBLE_LIMIT_PROD }}
+
+jobs:
+  download-merge-deploy:
+    # The GitHub Environment supplies approvals and environment-specific secrets.
+    environment: ${{ inputs.target_environment }}
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out Ansible deployment repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install deployment dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            "PyYAML==6.0.3" \
+            "ansible-core==2.19.*"
+
+          requirements="$(dirname "${PLAYBOOK_PATH}")/requirements.yml"
+          if [[ -f "${requirements}" ]]; then
+            ansible-galaxy collection install --requirements-file "${requirements}"
+          fi
+
+      - name: Validate deployment inputs
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${CONFIG_VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "Invalid config version: ${CONFIG_VERSION}" >&2
+            exit 1
+          fi
+          if [[ -z "${NEXUS_BASE_URL}" || -z "${NEXUS_REPOSITORY}" ]]; then
+            echo "Repository variables NEXUS_BASE_URL and NEXUS_CONFIG_REPOSITORY are required" >&2
+            exit 1
+          fi
+          if [[ ! -f "${PLAYBOOK_PATH}" ]]; then
+            echo "Playbook does not exist: ${PLAYBOOK_PATH}" >&2
+            exit 1
+          fi
+          if [[ ! -e "${INVENTORY_PATH}" ]]; then
+            echo "Inventory does not exist: ${INVENTORY_PATH}" >&2
+            exit 1
+          fi
+
+          case "${TARGET_ENVIRONMENT}" in
+            dev)  ansible_limit="${ANSIBLE_LIMIT_DEV:-DEV_GH}" ;;
+            pat)  ansible_limit="${ANSIBLE_LIMIT_PAT:-PAT}" ;;
+            prod) ansible_limit="${ANSIBLE_LIMIT_PROD:-PRD}" ;;
+            *) echo "Unsupported environment: ${TARGET_ENVIRONMENT}" >&2; exit 1 ;;
+          esac
+
+          artifact="${APPLICATION}-config-${CONFIG_VERSION}.tar.gz"
+          echo "artifact=${artifact}" >> "${GITHUB_OUTPUT}"
+          echo "ansible_limit=${ansible_limit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download artifact and checksum from Nexus
+        env:
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="${NEXUS_BASE_URL%/}/repository/${NEXUS_REPOSITORY}/${APPLICATION}/${CONFIG_VERSION}"
+          curl --fail-with-body --silent --show-error --retry 3 \
+            --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --output "${RUNNER_TEMP}/${ARTIFACT_NAME}" \
+            "${base}/${ARTIFACT_NAME}"
+          curl --fail-with-body --silent --show-error --retry 3 \
+            --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --output "${RUNNER_TEMP}/${ARTIFACT_NAME}.sha256" \
+            "${base}/${ARTIFACT_NAME}.sha256"
+
+          (
+            cd "${RUNNER_TEMP}"
+            sha256sum --check "${ARTIFACT_NAME}.sha256"
+          )
+
+      - name: Safely extract, merge defaults, and expose Ansible environment values
+        env:
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import tarfile
+          from pathlib import Path
+
+          import yaml
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          archive = temp / os.environ["ARTIFACT_NAME"]
+          extract_root = temp / "downloaded-config"
+          extract_root.mkdir(parents=True, exist_ok=False)
+
+          with tarfile.open(archive, "r:gz") as bundle:
+              root = extract_root.resolve()
+              for member in bundle.getmembers():
+                  destination = (extract_root / member.name).resolve()
+                  if destination != root and root not in destination.parents:
+                      raise SystemExit(f"Unsafe path in archive: {member.name}")
+                  if member.issym() or member.islnk() or member.isdev():
+                      raise SystemExit(f"Unsupported archive member: {member.name}")
+              bundle.extractall(extract_root, filter="data")
+
+          config_root = extract_root / os.environ["APPLICATION"]
+          defaults_path = config_root / "defaults.yml"
+          environment_path = config_root / f"{os.environ['TARGET_ENVIRONMENT']}-config.yml"
+
+          def load_mapping(path: Path):
+              if not path.is_file():
+                  raise SystemExit(f"Required configuration file is missing: {path}")
+              with path.open(encoding="utf-8") as stream:
+                  value = yaml.safe_load(stream) or {}
+              if not isinstance(value, dict):
+                  raise SystemExit(f"Top level must be a YAML mapping: {path}")
+              return value
+
+          def deep_merge(base, override):
+              result = dict(base)
+              for key, value in override.items():
+                  if isinstance(result.get(key), dict) and isinstance(value, dict):
+                      result[key] = deep_merge(result[key], value)
+                  else:
+                      result[key] = value
+              return result
+
+          merged = deep_merge(load_mapping(defaults_path), load_mapping(environment_path))
+          env_vars = merged.get("ENV_VARS", {})
+          jvm_args = merged.get("JVM_ARGS", [])
+          run_args = merged.get("RUN_ARGS", [])
+
+          if not isinstance(env_vars, dict):
+              raise SystemExit("Merged ENV_VARS must be a mapping")
+          invalid_names = [
+              name for name in env_vars
+              if not isinstance(name, str)
+              or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+          ]
+          if invalid_names:
+              raise SystemExit(f"Invalid shell variable name(s): {invalid_names}")
+          invalid_values = [
+              name for name, value in env_vars.items() if not isinstance(value, str)
+          ]
+          if invalid_values:
+              raise SystemExit(f"ENV_VARS values must be strings: {invalid_values}")
+          if not isinstance(jvm_args, list) or not all(isinstance(v, str) for v in jvm_args):
+              raise SystemExit("Merged JVM_ARGS must be a list of strings")
+          if not isinstance(run_args, list) or not all(isinstance(v, str) for v in run_args):
+              raise SystemExit("Merged RUN_ARGS must be a list of strings")
+
+          resolved = temp / "resolved-config.yml"
+          resolved.write_text(yaml.safe_dump(merged, sort_keys=False), encoding="utf-8")
+
+          # Compact JSON stays on one line in GITHUB_ENV. group_vars must use from_json.
+          exports = {
+              "ENV_VARS": env_vars,
+              "JVM_ARGS": jvm_args,
+              "RUN_ARGS": run_args,
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+              for name, value in exports.items():
+                  stream.write(f"{name}={json.dumps(value, separators=(',', ':'))}\n")
+              stream.write(f"RESOLVED_CONFIG_FILE={resolved}\n")
+              stream.write(f"CONFIG_ENVIRONMENT={os.environ['TARGET_ENVIRONMENT']}\n")
+          PY
+
+      - name: Prepare optional SSH private key
+        env:
+          ANSIBLE_SSH_PRIVATE_KEY: ${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANSIBLE_SSH_PRIVATE_KEY}" ]]; then
+            key_file="${RUNNER_TEMP}/ansible-ssh-key"
+            install -m 0600 /dev/null "${key_file}"
+            printf '%s\n' "${ANSIBLE_SSH_PRIVATE_KEY}" > "${key_file}"
+            echo "ANSIBLE_PRIVATE_KEY_FILE=${key_file}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Render and deploy start/stop scripts with Ansible
+        env:
+          ANSIBLE_LIMIT: ${{ steps.metadata.outputs.ansible_limit }}
+          ANSIBLE_REMOTE_USER: ${{ secrets.ANSIBLE_REMOTE_USER }}
+          ANSIBLE_PASSWORD: ${{ secrets.ANSIBLE_PASSWORD }}
+          ANSIBLE_BECOME_PASS: ${{ secrets.ANSIBLE_BECOME_PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ENV_VARS/JVM_ARGS/RUN_ARGS are inherited from GITHUB_ENV and are read
+          # by lookup('ansible.builtin.env', ...) in the environment group_vars.
+          ansible-playbook \
+            --inventory "${INVENTORY_PATH}" \
+            "${PLAYBOOK_PATH}" \
+            --limit "${ANSIBLE_LIMIT}" \
+            --tags "${DEPLOY_TAGS}" \
+            --extra-vars "config_environment=${TARGET_ENVIRONMENT}"
+
+          {
+            echo "### Config deployed"
+            echo "- Application: \`${APPLICATION}\`"
+            echo "- Environment: \`${TARGET_ENVIRONMENT}\`"
+            echo "- Config version: \`${CONFIG_VERSION}\`"
+            echo "- Ansible limit: \`${ANSIBLE_LIMIT}\`"
+            echo "- Tags: \`${DEPLOY_TAGS}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

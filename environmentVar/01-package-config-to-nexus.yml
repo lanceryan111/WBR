@@ -1,0 +1,224 @@
+name: Package application config to Nexus
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_version:
+        description: "Immutable config version; leave empty to generate one from the commit/run"
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - "fraud-detection-fraudster/**"
+      - ".github/workflows/01-package-config-to-nexus.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: config-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Change these two values if the config folder/artifact name differs.
+  CONFIG_ROOT: fraud-detection-fraudster
+  APPLICATION: fraud-detection-fraudster
+  REQUESTED_VERSION: ${{ inputs.config_version }}
+  NEXUS_BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+  NEXUS_REPOSITORY: ${{ vars.NEXUS_CONFIG_REPOSITORY }}
+
+jobs:
+  package-and-upload:
+    # An internal Nexus normally requires a self-hosted runner with network access.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out config repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install YAML validator
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "PyYAML==6.0.3"
+
+      - name: Resolve and validate version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${REQUESTED_VERSION}" ]]; then
+            version="${REQUESTED_VERSION}"
+          else
+            version="git-${GITHUB_SHA:0:12}-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          if [[ ! "${version}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "Invalid config version: ${version}" >&2
+            exit 1
+          fi
+          if [[ ! "${APPLICATION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "Invalid application name: ${APPLICATION}" >&2
+            exit 1
+          fi
+          if [[ -z "${NEXUS_BASE_URL}" || -z "${NEXUS_REPOSITORY}" ]]; then
+            echo "Repository variables NEXUS_BASE_URL and NEXUS_CONFIG_REPOSITORY are required" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "artifact=${APPLICATION}-config-${version}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate and package configuration
+        env:
+          CONFIG_VERSION: ${{ steps.metadata.outputs.version }}
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          root = Path(os.environ["CONFIG_ROOT"])
+          expected = [
+              "defaults.yml",
+              "dev-config.yml",
+              "pat-config.yml",
+              "prod-config.yml",
+          ]
+
+          def load_mapping(path: Path):
+              if not path.is_file():
+                  raise SystemExit(f"Required configuration file is missing: {path}")
+              with path.open(encoding="utf-8") as stream:
+                  value = yaml.safe_load(stream) or {}
+              if not isinstance(value, dict):
+                  raise SystemExit(f"Top level must be a YAML mapping: {path}")
+              return value
+
+          def deep_merge(base, override):
+              result = dict(base)
+              for key, value in override.items():
+                  if isinstance(result.get(key), dict) and isinstance(value, dict):
+                      result[key] = deep_merge(result[key], value)
+                  else:
+                      # Lists and scalar values replace their default value in full.
+                      result[key] = value
+              return result
+
+          defaults = load_mapping(root / "defaults.yml")
+          for filename in expected[1:]:
+              merged = deep_merge(defaults, load_mapping(root / filename))
+
+              env_vars = merged.get("ENV_VARS", {})
+              jvm_args = merged.get("JVM_ARGS", [])
+              run_args = merged.get("RUN_ARGS", [])
+
+              if not isinstance(env_vars, dict):
+                  raise SystemExit(f"ENV_VARS must be a mapping after merge: {filename}")
+              invalid_names = [
+                  name for name in env_vars
+                  if not isinstance(name, str)
+                  or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+              ]
+              if invalid_names:
+                  raise SystemExit(f"Invalid shell variable name(s) in {filename}: {invalid_names}")
+              invalid_values = [
+                  name for name, value in env_vars.items() if not isinstance(value, str)
+              ]
+              if invalid_values:
+                  raise SystemExit(
+                      f"ENV_VARS values must be strings in {filename}: {invalid_values}"
+                  )
+              if not isinstance(jvm_args, list) or not all(isinstance(v, str) for v in jvm_args):
+                  raise SystemExit(f"JVM_ARGS must be a list of strings after merge: {filename}")
+              if not isinstance(run_args, list) or not all(isinstance(v, str) for v in run_args):
+                  raise SystemExit(f"RUN_ARGS must be a list of strings after merge: {filename}")
+
+          staging = Path(os.environ["RUNNER_TEMP"]) / "config-package" / os.environ["APPLICATION"]
+          staging.mkdir(parents=True, exist_ok=False)
+          for filename in expected:
+              (staging / filename).write_bytes((root / filename).read_bytes())
+
+          manifest = {
+              "application": os.environ["APPLICATION"],
+              "configVersion": os.environ["CONFIG_VERSION"],
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["GITHUB_SHA"],
+              "files": expected,
+          }
+          (staging / "manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+          artifact_path="${RUNNER_TEMP}/${ARTIFACT_NAME}"
+          tar \
+            --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "${artifact_path}" \
+            -C "${RUNNER_TEMP}/config-package" \
+            "${APPLICATION}"
+
+          (
+            cd "${RUNNER_TEMP}"
+            sha256sum "${ARTIFACT_NAME}" > "${ARTIFACT_NAME}.sha256"
+          )
+
+      - name: Upload immutable artifact and checksum to Nexus
+        env:
+          CONFIG_VERSION: ${{ steps.metadata.outputs.version }}
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="${NEXUS_BASE_URL%/}/repository/${NEXUS_REPOSITORY}/${APPLICATION}/${CONFIG_VERSION}"
+          artifact_url="${base}/${ARTIFACT_NAME}"
+
+          status="$({ curl --silent --show-error \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            "${artifact_url}" || true; })"
+
+          case "${status}" in
+            404) ;;
+            200) echo "Refusing to overwrite existing Nexus artifact: ${artifact_url}" >&2; exit 1 ;;
+            *) echo "Nexus preflight returned HTTP ${status} for ${artifact_url}" >&2; exit 1 ;;
+          esac
+
+          curl --fail-with-body --silent --show-error --retry 3 \
+            --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file "${RUNNER_TEMP}/${ARTIFACT_NAME}" \
+            "${artifact_url}"
+
+          curl --fail-with-body --silent --show-error --retry 3 \
+            --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file "${RUNNER_TEMP}/${ARTIFACT_NAME}.sha256" \
+            "${artifact_url}.sha256"
+
+          {
+            echo "### Config published"
+            echo "- Application: \`${APPLICATION}\`"
+            echo "- Version: \`${CONFIG_VERSION}\`"
+            echo "- Nexus path: \`${APPLICATION}/${CONFIG_VERSION}/${ARTIFACT_NAME}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
