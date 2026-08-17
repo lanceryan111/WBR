@@ -1,0 +1,73 @@
+---
+# ============================================================================
+# Completes the draft you sketched at DEV_GH.yml lines 26-27 (图5).
+#
+# Add this block to EACH group_vars file that should receive injected config:
+#   wbr_actions/ansible/.../wbr_wbrsvc-fraud-detection/group_vars/DEV_GH.yml
+#                                                               DEV.yml
+#                                                               PAT.yml
+#                                                               DRP.yml
+#                                                               PRD.yml
+#
+# Better: put it in all.yml once, since the values come from the environment
+# rather than from the file, so all five copies would be identical anyway.
+# The per-environment differences live in wbr-app-config, not here - that is
+# the whole point of moving them to Nexus.
+# ============================================================================
+
+# ---- app config injected by download-and-deploy-config.yml -----------------
+#
+# Your draft was:
+#     # environment_jvm_properties:
+#     #   jvm_args: "{{ lookup('env', 'JVM_ARGS') }}"
+#
+# That works for a scalar but not for JVM_ARGS, which is a YAML *list* in
+# dev-config.yml. A bare lookup returns the string "['-Xms1024m', '-Xmx2048m']"
+# and `| join(' ')` in start_app.sh.j2 would then iterate it character by
+# character. The deploy workflow therefore exports JSON, and we decode it
+# here, which gives a real list back.
+#
+# `| default('[]', true)` matters: lookup('env', ...) returns '' for an unset
+# variable, and the `true` argument makes default() replace empty strings too
+# (not just undefined). Without it, from_json chokes on '' when the playbook
+# runs outside the workflow.
+
+app_config_jvm_args: "{{ lookup('env', 'JVM_ARGS')     | default('[]', true) | from_json }}"
+app_config_run_args: "{{ lookup('env', 'RUN_ARGS')     | default('[]', true) | from_json }}"
+app_config_env_vars: "{{ lookup('env', 'APP_ENV_VARS') | default('{}', true) | from_json }}"
+
+# ---- optional: keep the per-app dict shape ---------------------------------
+# Only needed if you want to preserve the `environment_jvm_properties[<app>]`
+# indexing style from your draft at start_app.sh.j2 line 27. The template I
+# sent uses app_config_jvm_args directly instead, which is simpler - one app
+# per role means the extra dict layer buys nothing. Uncomment if you have
+# roles that genuinely deploy several apps and need to key by name.
+#
+# environment_jvm_properties:
+#   "{{ deploy_app_details.name }}": "{{ app_config_jvm_args }}"
+
+
+# ============================================================================
+# Two unrelated things I noticed while reading the role
+# ============================================================================
+#
+# 1. deploy_scripts.yml (图3) line 9:
+#
+#        remote_src: "{{ 'yes' if config_environment == 'local' else 'no' | bool }}"
+#
+#    The `| bool` binds to 'no' alone, not to the whole conditional, so this
+#    parses as:  'yes' if cond else ('no' | bool)
+#    meaning it yields the *string* 'yes' or the *boolean* False. It happens
+#    to behave correctly today because Ansible coerces 'yes' to true, but it
+#    is accidental. Parenthesise it:
+#
+#        remote_src: "{{ ('yes' if config_environment == 'local' else 'no') | bool }}"
+#
+# 2. Variable naming is inconsistent across the role:
+#      deploy_scripts.yml   uses  app_name  /  app_name | lower
+#      start_app.sh.j2      uses  deploy_app_details.name
+#      your draft block     uses  application.name
+#    `application` appears nowhere else, so I treated it as aspirational and
+#    used deploy_app_details.name. Worth settling on one name before this
+#    grows - the config injection makes the templates read these vars in more
+#    places, so an inconsistency here gets more expensive over time.

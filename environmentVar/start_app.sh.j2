@@ -1,0 +1,99 @@
+#!/bin/sh
+{#
+  wbr_actions/ansible/.../wbr_wbrsvc-fraud-detection/tasks/templates/start_app.sh.j2
+
+  ==========================================================================
+  READ THIS FIRST
+  ==========================================================================
+  I could only see your file in a photo, and the right-hand side of lines
+  5, 8, 15, 19 and 27-30 was cut off. Every line marked "RECONSTRUCTED"
+  below is my best reading of a truncated line - diff it against your real
+  file before committing, the truncated tails are almost certainly not
+  character-for-character right.
+
+  What actually changed, and why:
+
+  1. Lines 13-17 of your version were hardcoded (JAVA_HEAP_SIZE 2048m,
+     RUN_ARGS=""). No Jinja variable, so no amount of clean plumbing in the
+     workflows could have changed the rendered output. They now read from
+     the injected config, with your hardcoded values kept as fallback.
+
+  2. Your "# >> CONFIGURATION <<" block sat at lines 24-30, AFTER the
+     `exit "${EXIT_CODE}"` on line 22. That is unreachable - the script
+     always exits before reaching it. Its intent is folded into the live
+     path above the `su` call now.
+
+  3. That block indexed `environment_jvm_properties[application.name]`, but
+     `application.name` does not appear anywhere else in your role - the
+     working lines all use `deploy_app_details.name`. I used
+     `deploy_app_details.name`. If `application` is a real var defined
+     somewhere I could not see, switch it back.
+
+  4. Values arrive as JSON in env vars, decoded in group_vars - see
+     group_vars_snippet.yml.
+
+  Renders correctly under Ansible's Jinja defaults (trim_blocks=true,
+  lstrip_blocks=false).
+#}
+{# Resolve injected config. `| default(..., true)` also catches the empty
+   values you get when the deploy runs without the config workflow having
+   set anything, so this template still renders standalone. #}
+{% set cfg_env_vars = app_config_env_vars | default({}, true) %}
+{% set cfg_jvm_args = app_config_jvm_args | default([], true) %}
+{% set cfg_run_args = app_config_run_args | default([], true) %}
+{# Your previous hardcoded heap settings, now only used when the config
+   supplies no JVM args. This is the "覆盖掉 default 的值" behaviour: the
+   role default stands until wbr-app-config overrides it. #}
+{% set fallback_jvm_args = ['-Xms2048m', '-Xmx2048m'] %}
+{% set effective_jvm_args = cfg_jvm_args if cfg_jvm_args else fallback_jvm_args %}
+{# RECONSTRUCTED - line 5 tail was cut off in the photo #}
+export JARFILE={{ app_folders.app_deployment }}/{{ deploy_app_details.nexus_gav_binary.artifact_id }}.jar
+export SERVICE_ACCOUNT={{ service_account }}
+export LOG_LOCATION={{ app_folders.logs }}/{{ deploy_app_details.name }}
+{# RECONSTRUCTED - line 8 tail was cut off #}
+export RC_LOG_PATH="${LOG_LOCATION}/{{ deploy_app_details.nexus_gav_binary.artifact_id }}.rc"
+export CONFIG_DIRECTORY={{ app_folders.config }}/{{ deploy_app_details.name }}
+export STARTUP_LOG_FILE_NAME="{{ deploy_app_details.name }}-Startup-$(hostname).log"
+
+# ======== APPLICATION ENV VARS ========
+{# From ENV_VARS in <env>-config.yml (图1: ENV: "dev", NAME: "foo").
+   dictsort keeps the output order stable so Ansible does not report the
+   template as "changed" just because a dict happened to iterate
+   differently between runs. #}
+{% if cfg_env_vars %}
+{% for key, value in cfg_env_vars | dictsort %}
+export {{ key }}="{{ value }}"
+{% endfor %}
+{% else %}
+# (no ENV_VARS supplied by wbr-app-config for this environment)
+{% endif %}
+
+# ======== JAVA OPTIONS ========
+export JAVA_HOME="${JAVA_HOME:-/usr/bin}"
+export JAVA_CMD="${JAVA_HOME}/java"
+{# JVM args are split into two parts on purpose:
+     - per-environment sizing comes from config (JVM_ARGS)
+     - structural flags stay in the template, because they depend on
+       app_folders / the app name and are not something an env config
+       should own.
+   RECONSTRUCTED - the -XX: tail of your line 15 and the -D flags on your
+   lines 28-29 were cut off; verify these against the real file. #}
+export JAVA_OPTS="{{ effective_jvm_args | join(' ') }} -XX:+CrashOnOutOfMemoryError -Dlog.root.dir={{ app_folders.logs }}/{{ deploy_app_details.name }} -Dspring.config.additional-location=file:{{ app_folders.config }}/{{ deploy_app_details.name }}/"
+
+{# From RUN_ARGS in <env>-config.yml (图1: RUN_ARGS: ["D"]).
+   NOTE: your draft line 30 was building RUN_ARGS out of a `>>` log
+   redirection. I did not carry that over - the redirection already happens
+   in the `su` line below, and folding it into RUN_ARGS would emit it twice.
+   If you did want the redirect to live in RUN_ARGS, move it here and take
+   it out of the su line - not both. #}
+export RUN_ARGS="{{ cfg_run_args | join(' ') }}"
+
+# ======== LAUNCH ========
+{# RECONSTRUCTED - line 19 tail was cut off; this is the shape your line
+   implied: run as the service account, send startup output to the startup
+   log, capture the exit code into RC_LOG_PATH. #}
+su "${SERVICE_ACCOUNT}" -c "sh -c '${JAVA_CMD} ${JAVA_OPTS} -jar ${JARFILE} ${RUN_ARGS} > ${LOG_LOCATION}/${STARTUP_LOG_FILE_NAME} 2>&1; echo \$? > ${RC_LOG_PATH}'"
+
+EXIT_CODE=$(cat "${RC_LOG_PATH}")
+echo "Application Exit with code ${EXIT_CODE}"
+exit "${EXIT_CODE}"

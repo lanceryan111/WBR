@@ -1,0 +1,277 @@
+name: Download App Config from Nexus and Deploy
+
+# ============================================================================
+# Repo:  wbr-ghrunner-libs (next to wbr_actions/ansible/.../wbr_wbrsvc-fraud-detection/)
+#
+# Flow:
+#   1. resolve config version (explicit, or latest from maven-metadata.xml)
+#   2. download <app>-<version>.tar.gz from Nexus by GAV
+#   3. merge defaults.yml + <env>-config.yml   (图1)
+#   4. export the merged result as JSON-encoded env vars
+#   5. run ansible-playbook --tags deploy_app_scripts
+#
+# Step 4 keeps the lookup('env', ...) pattern you already use everywhere in
+# group_vars (图5), but the VALUES ARE JSON, not bare strings. That matters:
+# JVM_ARGS in dev-config.yml is a YAML list, and a bare env var would flatten
+# it to a string that group_vars then has to split back apart on some
+# separator. JSON survives the round trip intact:
+#
+#     JVM_ARGS      ->  ["-Xms1024m","-Xmx2048m"]
+#     RUN_ARGS      ->  ["D"]
+#     APP_ENV_VARS  ->  {"ENV":"dev","NAME":"foo"}
+#
+# and group_vars decodes with | from_json. See group_vars_snippet.yml.
+#
+# Note on APP_ENV_VARS: the ENV_VARS block is exported under ONE namespaced
+# var rather than as individual ENV= / NAME= vars. Those two names are far too
+# generic to set on a CI runner - NAME in particular collides with things
+# already in the shell environment. They are meant for the app on the target
+# host, and start_app.sh.j2 renders them there as export lines.
+#
+# TODO before first use - search for "TODO":
+#   - GROUP_ID: keep in sync with package-and-upload-config.yml
+#   - PLAYBOOK_PATH / INVENTORY_PATH: point at your real playbook + inventory
+#   - runs-on label + network reachability to the target hosts
+#   - Secrets: NEXUS_URL, NEXUS_USERNAME, NEXUS_PASSWORD,
+#     ANSIBLE_REMOTE_USER, ANSIBLE_BECOME_PASS, ANSIBLE_PASSWORD (图5)
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, pat, drp, prod]
+      app_name:
+        description: 'App name - must equal the artifactId used at upload time'
+        required: true
+      config_version:
+        description: 'Config version to deploy. Blank = resolve latest from Nexus.'
+        required: false
+        default: ''
+      inventory_group:
+        description: >-
+          Inventory group / --limit to target. Blank = uppercase of environment.
+          Note your group_vars are DEV_GH, DEV, PAT, DRP, PRD - so for prod you
+          likely want PRD here, not PROD.
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run ansible-playbook with --check --diff instead of applying'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GROUP_ID: com.wbr.appconfig # TODO: keep in sync with the packaging workflow
+  NEXUS_URL: ${{ secrets.NEXUS_URL }}
+  PLAYBOOK_PATH: wbr_actions/ansible/wbr_wbrsvc-fraud-detection/deploy_application.yml # TODO: confirm
+  INVENTORY_PATH: wbr_actions/ansible/inventories/${{ inputs.environment }} # TODO: confirm
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, wbr-ghrunner] # TODO: confirm runner label
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          command -v ansible-playbook >/dev/null 2>&1 \
+            || python3 -m pip install --quiet --break-system-packages ansible
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      # Avoids the LATEST / RELEASE metaversions, which Maven 3 deprecated and
+      # which resolve inconsistently. maven-metadata.xml is written by
+      # deploy:deploy-file in the packaging workflow, so it is always current.
+      - name: Resolve config version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.config_version }}
+          APP_NAME: ${{ inputs.app_name }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+
+          if [ -z "$version" ]; then
+            group_path="$(printf '%s' "$GROUP_ID" | tr '.' '/')"
+            meta_url="${NEXUS_URL}/${group_path}/${APP_NAME}/maven-metadata.xml"
+            echo "Resolving latest from $meta_url"
+
+            if ! curl -sSfL -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "$meta_url" -o maven-metadata.xml; then
+              echo "::error::could not fetch maven-metadata.xml for $APP_NAME - has this app's config ever been published?"
+              exit 1
+            fi
+
+            version="$(python3 -c "
+          import sys, xml.etree.ElementTree as ET
+          v = ET.parse('maven-metadata.xml').getroot().find('versioning')
+          for tag in ('release', 'latest'):
+              node = v.find(tag) if v is not None else None
+              if node is not None and node.text:
+                  print(node.text.strip()); sys.exit(0)
+          sys.exit('no <release> or <latest> in maven-metadata.xml')
+          ")"
+            echo "::notice::resolved latest config version for $APP_NAME = $version"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Using config version: $version"
+
+      - name: Download config artifact from Nexus
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          group_path="$(printf '%s' "$GROUP_ID" | tr '.' '/')"
+          url="${NEXUS_URL}/${group_path}/${APP_NAME}/${VERSION}/${APP_NAME}-${VERSION}.tar.gz"
+
+          echo "Downloading $url"
+          curl -sSfL -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "$url" -o config.tar.gz
+
+          mkdir -p config-extracted
+          tar -xzf config.tar.gz -C config-extracted
+          echo "Extracted:"
+          ls -la config-extracted
+          [ -f config-extracted/BUILD-INFO.txt ] && cat config-extracted/BUILD-INFO.txt
+
+      - name: Merge defaults + environment config, export as JSON env vars
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, sys, yaml
+
+          target_env = os.environ["TARGET_ENV"]
+          base_dir = "config-extracted"
+
+          # Workflow env name -> config filename prefix in wbr-app-config (图1).
+          # Kept explicit because the names genuinely diverge: the repo has
+          # prod-config.yml while group_vars calls that environment PRD.
+          prefix = {"dev": "dev", "pat": "pat", "drp": "drp", "prod": "prod"}[target_env]
+
+          defaults_path = os.path.join(base_dir, "defaults.yml")
+          env_path = os.path.join(base_dir, f"{prefix}-config.yml")
+
+          if not os.path.exists(defaults_path):
+              sys.exit(f"::error::defaults.yml missing from the artifact")
+
+          # Fail loudly. Silently deploying defaults-only because someone
+          # renamed a file is exactly the bug you find at 2am in prod.
+          if not os.path.exists(env_path):
+              available = sorted(f for f in os.listdir(base_dir) if f.endswith("-config.yml"))
+              sys.exit(f"::error::{prefix}-config.yml not found in the artifact. "
+                       f"Available: {available or 'none'}")
+
+          merged = yaml.safe_load(open(defaults_path)) or {}
+          override = yaml.safe_load(open(env_path)) or {}
+
+          def deep_merge(base, extra):
+              """Env config wins over defaults, nested dicts merge key by key."""
+              for k, v in extra.items():
+                  if isinstance(v, dict) and isinstance(base.get(k), dict):
+                      deep_merge(base[k], v)
+                  else:
+                      base[k] = v
+              return base
+
+          merged = deep_merge(merged, override)
+
+          # Compact JSON has no literal newlines, so plain KEY=VALUE lines in
+          # GITHUB_ENV are safe - no heredoc delimiter needed.
+          def dump(value):
+              return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+          exported = {
+              "JVM_ARGS": dump(merged.get("JVM_ARGS") or []),
+              "RUN_ARGS": dump(merged.get("RUN_ARGS") or []),
+              "APP_ENV_VARS": dump(merged.get("ENV_VARS") or {}),
+          }
+
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for key, value in exported.items():
+                  fh.write(f"{key}={value}\n")
+
+          print(f"Merged {defaults_path} <- {env_path}")
+          for key, value in exported.items():
+              print(f"  {key}={value}")
+
+          # Also keep the merged file around as a build artifact for debugging.
+          with open("merged-config.yml", "w") as fh:
+              yaml.safe_dump(merged, fh, default_flow_style=False, sort_keys=True)
+          PYEOF
+
+      - name: Show merged config
+        run: cat merged-config.yml
+
+      - name: Run Ansible deploy
+        env:
+          ANSIBLE_REMOTE_USER: ${{ secrets.ANSIBLE_REMOTE_USER }}
+          ANSIBLE_BECOME_PASS: ${{ secrets.ANSIBLE_BECOME_PASS }}
+          ANSIBLE_PASSWORD: ${{ secrets.ANSIBLE_PASSWORD }}
+          ANSIBLE_HOST_KEY_CHECKING: 'False'
+          TARGET_ENV: ${{ inputs.environment }}
+          APP_NAME: ${{ inputs.app_name }}
+          INVENTORY_GROUP: ${{ inputs.inventory_group }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # JVM_ARGS / RUN_ARGS / APP_ENV_VARS were written to GITHUB_ENV by the
+          # merge step, so they are real process env vars here - which is what
+          # lookup('env', ...) in group_vars reads.
+          limit="${INVENTORY_GROUP:-}"
+          [ -z "$limit" ] && limit="$(printf '%s' "$TARGET_ENV" | tr '[:lower:]' '[:upper:]')"
+
+          check_flags=""
+          [ "$DRY_RUN" = "true" ] && check_flags="--check --diff"
+
+          echo "Deploying $APP_NAME to $TARGET_ENV (limit: $limit)"
+
+          # shellcheck disable=SC2086
+          ansible-playbook \
+            -i "$INVENTORY_PATH" \
+            "$PLAYBOOK_PATH" \
+            --limit "$limit" \
+            -e "config_environment=$TARGET_ENV" \
+            -e "app_name=$APP_NAME" \
+            --tags deploy_app_scripts \
+            $check_flags
+
+      - name: Upload merged config as run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-config-${{ inputs.app_name }}-${{ inputs.environment }}
+          path: merged-config.yml
+          if-no-files-found: ignore
+
+      - name: Summary
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          {
+            echo "### Config deployed"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| app | \`$APP_NAME\` |"
+            echo "| environment | \`$TARGET_ENV\` |"
+            echo "| config version | \`$VERSION\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+            echo ""
+            echo '```yaml'
+            cat merged-config.yml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

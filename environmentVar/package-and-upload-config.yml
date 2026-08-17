@@ -1,0 +1,255 @@
+name: Package and Upload App Config to Nexus
+
+# ============================================================================
+# Repo:  wbr-app-config
+# Layout expected (图1):
+#   <app_name>/defaults.yml
+#   <app_name>/dev-config.yml
+#   <app_name>/pat-config.yml
+#   <app_name>/prod-config.yml
+#
+# Packages each app's config folder into <app_name>-<version>.tar.gz and
+# publishes it to Nexus as a Maven-hosted artifact, using the same GAV style
+# already used for the app jar in start_app.sh.j2
+# (deploy_app_details.nexus_gav_binary).
+#
+# The tarball is FLAT - defaults.yml and *-config.yml sit at the archive root,
+# no <app_name>/ prefix. download-and-deploy-config.yml relies on that.
+#
+# TODO before first use - search for "TODO":
+#   - GROUP_ID: set to your real Nexus groupId convention
+#   - runs-on label: set to your actual self-hosted runner pool
+#   - Secrets: NEXUS_URL (full repo URL, e.g.
+#     https://nexus.example.com/repository/maven-releases),
+#     NEXUS_USERNAME, NEXUS_PASSWORD
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/defaults.yml'
+      - '**/*-config.yml'
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App folder to package. Use 'all' for every app that has a defaults.yml."
+        required: true
+        default: 'all'
+      version:
+        description: "Artifact version. Leave blank to auto-generate YYYYMMDD.<run_number>."
+        required: false
+        default: ''
+
+env:
+  GROUP_ID: com.wbr.appconfig # TODO: your real Nexus groupId
+  NEXUS_URL: ${{ secrets.NEXUS_URL }}
+  NEXUS_REPOSITORY_ID: nexus-releases
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Decide which app folders need packaging. On push we only rebuild the apps
+  # whose config actually changed, so an unrelated edit doesn't republish
+  # every app in the repo.
+  # --------------------------------------------------------------------------
+  detect-apps:
+    runs-on: [self-hosted, wbr-ghrunner] # TODO: confirm runner label
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine which app folders to package
+        id: list
+        env:
+          # Inputs go through env, never interpolated straight into the shell -
+          # otherwise an app_name like `; rm -rf /` would execute.
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_APP_NAME: ${{ inputs.app_name }}
+          SHA_BEFORE: ${{ github.event.before }}
+          SHA_NOW: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          all_apps() {
+            find . -mindepth 2 -maxdepth 2 -name 'defaults.yml' \
+              | sed -e 's#^\./##' -e 's#/defaults\.yml$##' \
+              | sort -u
+          }
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_APP_NAME" != "all" ]; then
+            if [ ! -f "$INPUT_APP_NAME/defaults.yml" ]; then
+              echo "::error::'$INPUT_APP_NAME/defaults.yml' not found"
+              exit 1
+            fi
+            dirs="$INPUT_APP_NAME"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -z "$SHA_BEFORE" ] || [ "$SHA_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              # New branch or force push - no usable diff base, package everything.
+              dirs="$(all_apps)"
+            else
+              dirs="$(git diff --name-only "$SHA_BEFORE" "$SHA_NOW" \
+                | grep -E '/(defaults|[^/]*-config)\.yml$' \
+                | cut -d/ -f1 | sort -u || true)"
+              [ -z "$dirs" ] && dirs="$(all_apps)"
+            fi
+          else
+            dirs="$(all_apps)"
+          fi
+
+          apps="$(printf '%s\n' "$dirs" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          echo "Packaging: $apps"
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+
+  package-and-upload:
+    needs: detect-apps
+    if: needs.detect-apps.outputs.apps != '[]'
+    runs-on: [self-hosted, wbr-ghrunner] # TODO: confirm runner label
+    strategy:
+      fail-fast: false
+      matrix:
+        app_name: ${{ fromJson(needs.detect-apps.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          [ -z "$version" ] && version="$(date +%Y%m%d).${RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version: $version"
+
+      # Catch a broken YAML here rather than at deploy time on a prod host.
+      - name: Validate config YAML
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --break-system-packages pyyaml 2>/dev/null \
+            || python3 -m pip install --quiet pyyaml
+          python3 - <<'PYEOF'
+          import glob, os, sys, yaml
+
+          app = os.environ["APP_NAME"]
+          files = sorted(glob.glob(f"{app}/defaults.yml") + glob.glob(f"{app}/*-config.yml"))
+          if not files:
+              sys.exit(f"::error::no config files found under {app}/")
+
+          failed = False
+          for path in files:
+              try:
+                  data = yaml.safe_load(open(path)) or {}
+              except yaml.YAMLError as exc:
+                  print(f"::error file={path}::invalid YAML: {exc}")
+                  failed = True
+                  continue
+
+              if not isinstance(data, dict):
+                  print(f"::error file={path}::top level must be a mapping, got {type(data).__name__}")
+                  failed = True
+                  continue
+
+              # Shape check against 图1: ENV_VARS is a mapping, JVM_ARGS/RUN_ARGS are lists.
+              for key, expected in (("ENV_VARS", dict), ("JVM_ARGS", list), ("RUN_ARGS", list)):
+                  if key in data and not isinstance(data[key], expected):
+                      print(f"::error file={path}::{key} must be a {expected.__name__}, "
+                            f"got {type(data[key]).__name__}")
+                      failed = True
+
+              print(f"  ok  {path}  (keys: {', '.join(sorted(data)) or 'none'})")
+
+          sys.exit(1 if failed else 0)
+          PYEOF
+
+      - name: Package config folder into tar.gz
+        id: package
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+
+          # Only the config files go in - no README, no .gitignore, no stray files.
+          cp "$APP_NAME/defaults.yml" "$staging/"
+          find "$APP_NAME" -maxdepth 1 -name '*-config.yml' -exec cp {} "$staging/" \;
+
+          # Traceability: lets you answer "which commit produced the config
+          # currently deployed on that host?"
+          cat > "$staging/BUILD-INFO.txt" <<EOF
+          app_name=$APP_NAME
+          version=$VERSION
+          git_sha=$GIT_SHA
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          mkdir -p dist
+          tarball="dist/${APP_NAME}-${VERSION}.tar.gz"
+          tar -czf "$tarball" -C "$staging" .
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+          echo "Archive contents:"
+          tar -tzf "$tarball"
+
+      - name: Write Maven settings.xml
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>${NEXUS_REPOSITORY_ID}</id>
+                <username>${{ secrets.NEXUS_USERNAME }}</username>
+                <password>${{ secrets.NEXUS_PASSWORD }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      # deploy-file also writes maven-metadata.xml, which the deploy workflow
+      # reads to resolve "latest" without the deprecated LATEST metaversion.
+      - name: Deploy tar.gz to Nexus
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          mvn -B deploy:deploy-file \
+            -Durl="$NEXUS_URL" \
+            -DrepositoryId="$NEXUS_REPOSITORY_ID" \
+            -DgroupId="$GROUP_ID" \
+            -DartifactId="$APP_NAME" \
+            -Dversion="$VERSION" \
+            -Dpackaging=tar.gz \
+            -DgeneratePom=true \
+            -Dfile="$TARBALL"
+
+      - name: Summary
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "### Config published"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| app | \`$APP_NAME\` |"
+            echo "| version | \`$VERSION\` |"
+            echo "| GAV | \`$GROUP_ID:$APP_NAME:$VERSION:tar.gz\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
