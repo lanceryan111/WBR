@@ -1,0 +1,143 @@
+name: Download App Config from Nexus and Deploy
+
+# ============================================================================
+# Repo:  wbr-ghrunner-libs   Path: .github/workflows/wbr-deploy-app-config.yml
+#
+# Runs in the libs repo itself, so wbr_actions/ is already checked out - no
+# second checkout needed here. All logic is dispatched through main.py:
+#     download_app_config   pull <app>-<version>.tar.gz from raw Nexus, extract
+#     merge_app_config      defaults.yml + <env>-config.yml -> JSON env vars
+#     run_ansible_deploy    ansible-playbook --tags deploy_app_scripts
+#
+# merge_app_config keeps the lookup('env', ...) pattern you already use in
+# group_vars (图5), but exports JSON so lists survive the round trip:
+#     JVM_ARGS      ->  ["-Xms1024m","-Xmx2048m"]
+#     RUN_ARGS      ->  ["D"]
+#     APP_ENV_VARS  ->  {"ENV":"dev","NAME":"foo"}
+# group_vars decodes with | from_json. See group_vars_snippet.yml.
+#
+# TODO before first use - search for "TODO":
+#   - NEXUS_DIRECTORY_ROOT: must match the upload workflow
+#   - PLAYBOOK_PATH / INVENTORY_PATH: point at your real playbook + inventory
+#   - main.py dispatch: register the three new function names if it uses a
+#     hardcoded registry rather than dynamic import
+#   - requirements.txt needs PyYAML and requests
+#   - runs-on label + network reachability to the target hosts
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, pat, drp, prod]
+      app_name:
+        description: 'App name - must match the folder name in wbr-app-config'
+        required: true
+      config_version:
+        description: >-
+          Config version to deploy, e.g. 20260817.42. Required: a raw Nexus repo
+          has no maven-metadata.xml to resolve "latest" from, and pinning the
+          config version for a deploy is the safer habit anyway.
+        required: true
+      inventory_group:
+        description: >-
+          Inventory group / --limit. Blank = uppercase of environment. Your
+          group_vars are DEV_GH, DEV, PAT, DRP, PRD - so for prod you probably
+          want PRD here, not PROD.
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run ansible-playbook with --check --diff instead of applying'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ACTIONS_DIR: wbr_actions
+  NEXUS_HOST: "https://rp.td.com"
+  NEXUS_RAW_REPO: "application-managed-raw-3rd-party"
+  NEXUS_DIRECTORY_ROOT: "W000WBR/AppConfig" # TODO: must match the upload workflow
+  NEXUS_USERNAME: "pwbci"
+  EXTRACT_DIR: config-extracted
+  MERGED_CONFIG_PATH: merged-config.yml
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, wbr-ghrunner] # TODO: confirm runner label
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install action dependencies
+        run: |
+          python3 -m pip install --quiet -r "${ACTIONS_DIR}/requirements.txt"
+          command -v ansible-playbook >/dev/null 2>&1 \
+            || python3 -m pip install --quiet ansible
+
+      - name: Download app config from Nexus
+        run: python3 "${ACTIONS_DIR}/main.py"
+        env:
+          INPUT_FUNCTION: "download_app_config"
+          NEXUS_HOST: ${{ env.NEXUS_HOST }}
+          NEXUS_RAW_REPO: ${{ env.NEXUS_RAW_REPO }}
+          NEXUS_DIRECTORY_ROOT: ${{ env.NEXUS_DIRECTORY_ROOT }}
+          APP_NAME: ${{ inputs.app_name }}
+          CONFIG_VERSION: ${{ inputs.config_version }}
+          EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
+          NEXUS_USERNAME: ${{ env.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Merge defaults with environment config
+        run: python3 "${ACTIONS_DIR}/main.py"
+        env:
+          INPUT_FUNCTION: "merge_app_config"
+          TARGET_ENV: ${{ inputs.environment }}
+          EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
+          MERGED_CONFIG_PATH: ${{ env.MERGED_CONFIG_PATH }}
+
+      - name: Run Ansible deploy
+        run: python3 "${ACTIONS_DIR}/main.py"
+        env:
+          INPUT_FUNCTION: "run_ansible_deploy"
+          # JVM_ARGS / RUN_ARGS / APP_ENV_VARS reach this step through
+          # GITHUB_ENV, written by merge_app_config - that is what
+          # lookup('env', ...) in group_vars reads.
+          PLAYBOOK_PATH: wbr_actions/ansible/wbr_wbrsvc-fraud-detection/deploy_application.yml # TODO
+          INVENTORY_PATH: wbr_actions/ansible/inventories/${{ inputs.environment }} # TODO
+          TARGET_ENV: ${{ inputs.environment }}
+          APP_NAME: ${{ inputs.app_name }}
+          INVENTORY_GROUP: ${{ inputs.inventory_group }}
+          ANSIBLE_TAGS: deploy_app_scripts
+          DRY_RUN: ${{ inputs.dry_run }}
+          ANSIBLE_REMOTE_USER: ${{ secrets.ANSIBLE_REMOTE_USER }}
+          ANSIBLE_BECOME_PASS: ${{ secrets.ANSIBLE_BECOME_PASS }}
+          ANSIBLE_PASSWORD: ${{ secrets.ANSIBLE_PASSWORD }}
+          ANSIBLE_HOST_KEY_CHECKING: 'False'
+
+      - name: Upload merged config as run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-config-${{ inputs.app_name }}-${{ inputs.environment }}
+          path: ${{ env.MERGED_CONFIG_PATH }}
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          VERSION: ${{ inputs.config_version }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          {
+            echo "### Config deployed"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| app | \`$APP_NAME\` |"
+            echo "| environment | \`$TARGET_ENV\` |"
+            echo "| config version | \`$VERSION\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

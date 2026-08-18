@@ -1,0 +1,111 @@
+name: Package and Upload App Config to Nexus
+
+# ============================================================================
+# Repo:  wbr-app-config      Path: .github/workflows/wbr-upload-app-config.yml
+#
+# All logic lives in wbr-ghrunner-libs/wbr_actions/ and is dispatched through
+# main.py via INPUT_FUNCTION, same as your existing upload step:
+#     package_app_config   detect changed apps -> validate -> tar.gz
+#     upload_app_config    push each tarball to the raw Nexus repo
+#
+# Layout expected (图1):
+#   <app_name>/defaults.yml
+#   <app_name>/dev-config.yml  /  pat-config.yml  /  prod-config.yml
+#
+# Nexus layout produced:
+#   <NEXUS_DIRECTORY_ROOT>/<app_name>/<app_name>-<version>.tar.gz
+#
+# TODO before first use - search for "TODO":
+#   - NEXUS_DIRECTORY_ROOT: your libs use W000WBR/Libraries/wbr-ghrunner-libs,
+#     so I mirrored that shape. Confirm where app config should live.
+#   - GHRUNNER_LIBS_REPO + GH_PAT: a cross-repo private checkout cannot use the
+#     default GITHUB_TOKEN. Drop this step if main.py is already on the runner.
+#   - main.py dispatch: if it resolves INPUT_FUNCTION by dynamic import this
+#     works as-is; if it holds a hardcoded registry, add the two new names.
+#   - requirements.txt in wbr_actions needs PyYAML if it is not there already.
+#   - runs-on label
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/defaults.yml'
+      - '**/*-config.yml'
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App folder to package. 'all' = every app with a defaults.yml."
+        required: true
+        default: 'all'
+      version:
+        description: "Version. Blank = auto-generate YYYYMMDD.<run_number>."
+        required: false
+        default: ''
+
+env:
+  LIBS_DIR: wbr-ghrunner-libs
+  NEXUS_HOST: "https://rp.td.com"
+  NEXUS_RAW_REPO: "application-managed-raw-3rd-party"
+  NEXUS_DIRECTORY_ROOT: "W000WBR/AppConfig" # TODO: confirm with your Nexus admin
+  NEXUS_USERNAME: "pwbci"
+  GHRUNNER_LIBS_REPO: "your-org/wbr-ghrunner-libs" # TODO: real org/repo
+
+jobs:
+  package-and-upload:
+    runs-on: [self-hosted, wbr-ghrunner] # TODO: confirm runner label
+    steps:
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed for changed-app detection
+
+      - name: Checkout wbr-ghrunner-libs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GHRUNNER_LIBS_REPO }}
+          path: ${{ env.LIBS_DIR }}
+          token: ${{ secrets.GH_PAT }} # TODO: PAT with read access to the libs repo
+
+      - name: Install action dependencies
+        run: python3 -m pip install --quiet -r "${LIBS_DIR}/wbr_actions/requirements.txt"
+
+      - name: Package app config
+        id: package
+        run: python3 "${LIBS_DIR}/wbr_actions/main.py"
+        env:
+          INPUT_FUNCTION: "package_app_config"
+          APP_CONFIG_ROOT: "."
+          APP_NAME: ${{ inputs.app_name || 'all' }}
+          VERSION: ${{ inputs.version }}
+          GIT_SHA_BEFORE: ${{ github.event.before }}
+          GIT_SHA: ${{ github.sha }}
+          DIST_DIR: dist
+
+      - name: Upload app config to Nexus
+        run: python3 "${LIBS_DIR}/wbr_actions/main.py"
+        env:
+          INPUT_FUNCTION: "upload_app_config"
+          NEXUS_URL: "https://rp.td.com/service/rest/v1/components?repository=application-managed-raw-3rd-party"
+          NEXUS_DIRECTORY_ROOT: ${{ env.NEXUS_DIRECTORY_ROOT }}
+          APPS: ${{ steps.package.outputs.apps }}
+          VERSION: ${{ steps.package.outputs.version }}
+          DIST_DIR: dist
+          NEXUS_USERNAME: ${{ env.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Summary
+        if: always()
+        env:
+          APPS: ${{ steps.package.outputs.apps }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          {
+            echo "### Config published"
+            echo ""
+            echo "| app | version | nexus path |"
+            echo "|---|---|---|"
+            for app in $APPS; do
+              echo "| \`$app\` | \`$VERSION\` | \`${NEXUS_DIRECTORY_ROOT}/$app/$app-$VERSION.tar.gz\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
