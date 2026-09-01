@@ -1,0 +1,403 @@
+name: Integration Build
+# Standard build flow for non-release builds (master, project/*, concept/* branches).
+# Builds unsigned APKs, signs them via the signing-service, publishes to Nexus and
+# generates Confluence release notes.
+#
+# 基于截图重建并重构。核心思路：把 6 个 APK 的「逻辑名 ↔ gradle 输出路径」映射
+# 收敛为唯一事实来源（manifest），Stage / Sign matrix / Restore 全部从它派生，
+# 消除原来 4 处重复维护的清单（stage 的 6 行 cp、sign 的 matrix 列表、
+# restore 的 6 行 mkdir+cp、gradle task 列表——最后一个保留，见下方注释）。
+
+on:
+  push:
+    branches:
+      - master
+      - 'concept/**'
+      - 'project/**'
+  workflow_dispatch:
+    inputs:
+      DISABLE_BUILD_CACHE:
+        description: 'DISABLE_BUILD_CACHE'
+        type: boolean
+        default: false
+
+# 最小权限：workflow 级只读，写权限只给需要的 job（sonar_check 自带声明）
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # 修复：与 iOS 版同样的问题——注释说取消进行中的 run，但缺了这一行（默认是排队）
+  cancel-in-progress: true
+
+env:
+  # TODO(design): PATH / ANDROID_HOME / NDK / JAVA_HOME 硬编码 /Users/ciusr 与具体小版本，
+  # 建议移入 runner 镜像 profile 或仓库内受版本管理的 ci-env 脚本
+  PATH: "/Users/ciusr/.rbenv/bin:/Users/ciusr/.rbenv/shims:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+  RBENV_VERSION: 3.1.6
+  LANG: en_US.UTF-8
+  JAVA_HOME: /Library/Java/JavaVirtualMachines/jbrsdk-21.0.3-osx-aarch64-b509.11/Contents/Home
+  ANDROID_HOME: /Users/ciusr/Library/Android/sdk
+  ANDROID_NDK_HOME: /Users/ciusr/Library/Android/ndk/23.1.7779620
+  BUNDLE_GEMFILE: ${{ github.workspace }}/Gemfile
+
+jobs:
+  build:
+    # 原名 "Initialize" 名不副实——这个 job 构建、测试并暂存 APK
+    name: Build & Test
+    timeout-minutes: 120
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    outputs:
+      artifact_suffix: ${{ steps.branch.outputs.artifact_suffix }}
+      additional_params: ${{ steps.branch.outputs.additional_params }}
+      version_name: ${{ steps.stage.outputs.version_name }}
+      # 供 sign job 动态生成 matrix，避免第 3 份手工清单
+      artifact_list: ${{ steps.stage.outputs.artifact_list }}
+    steps:
+      # 恢复被注释掉的分支校验（修正了原正则的漏洞）。
+      # 这个校验对 Android 版尤其重要：workflow_dispatch 可以从任意分支触发，
+      # 而任意分支跑到 publish 会以空 ARTIFACT_SUFFIX 发布——和 master 构建
+      # 在 Nexus 上同名同坐标，直接污染主线制品。
+      - name: Validate branch type against workflow
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ ! "$REF" =~ ^refs/heads/(master$|project/|concept/) ]]; then
+            echo "Triggered branch type is not supported for this workflow"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Configure branch
+        id: branch
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          DISABLE_BUILD_CACHE: ${{ inputs.DISABLE_BUILD_CACHE }}
+        run: |
+          if [[ "$BRANCH_NAME" == project/* || "$BRANCH_NAME" == concept/* ]]; then
+            # 原来 iOS 用「最后一段」(sed 's/.*\///')、Android 用「第二段」(cut -d/ -f2)，
+            # 同一个分支在两个平台会得到不同的 Nexus 后缀；此处统一为最后一段，
+            # 也顺便正确处理 project/team/xyz 这类多级分支。请与 iOS 侧对齐后二选一。
+            ARTIFACT_SUFFIX="${BRANCH_NAME##*/}"
+          else
+            ARTIFACT_SUFFIX=""
+          fi
+
+          ADDITIONAL_PARAMS=""
+          if [[ "$DISABLE_BUILD_CACHE" == "true" ]]; then
+            ADDITIONAL_PARAMS="--no-build-cache"
+          fi
+
+          echo "artifact_suffix=$ARTIFACT_SUFFIX" >> "$GITHUB_OUTPUT"
+          # 输出为 job output，publish 直接复用，不再重复计算一遍同样的 if 块
+          echo "additional_params=$ADDITIONAL_PARAMS" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Update Gradle Wrapper
+        run: ./update-gradle-wrapper.sh
+        shell: bash
+
+      # ── 幂等性：自托管 runner 的 build/ 目录跨 run 残留。不建议 checkout clean: true
+      #（git clean -ffdx 会连 gradle 缓存一起清掉，牺牲增量构建），只精确清掉
+      # 本次要重新产出并暂存的 apk 输出目录——保证 Stage 复制到的一定是本次构建产物，
+      # 而不是上一次 run 的陈旧 APK。──
+      - name: Clean stale APK outputs
+        run: rm -rf app/build/outputs/apk unsigned-apks
+        shell: bash
+
+      - name: Build Unsigned Android APKs
+        env:
+          ARTIFACT_SUFFIX: ${{ steps.branch.outputs.artifact_suffix }}
+          ADDITIONAL_PARAMS: ${{ steps.branch.outputs.additional_params }}
+        run: |
+          # 注：这份 assemble 任务清单与 APK 映射天然对应，但 gradle task 名无法
+          # 从 manifest 机械推导（flavor 大小写规则），故保留为第二份清单；
+          # 若想彻底收敛，可在 gradle 里加一个聚合 task（如 assembleAllCiVariants）。
+          ./gradlew -PtdBuild=true \
+            -Ptd.artifactIdSuffix="$ARTIFACT_SUFFIX" \
+            $ADDITIONAL_PARAMS --info --stacktrace \
+            :app:assembleInternalDebug \
+            :app:assembleInternalDebugAndroidTest \
+            :app:assembleTdinvestingDebug \
+            :app:assembleTdinvestingDebugAndroidTest \
+            :app:assembleTdactivetraderDebug \
+            :app:assembleTdactivetraderDebugAndroidTest
+        shell: bash
+
+      - name: Test Android
+        env:
+          ADDITIONAL_PARAMS: ${{ steps.branch.outputs.additional_params }}
+        run: ./gradlew -PtdBuild=true testAll $ADDITIONAL_PARAMS --stacktrace
+        shell: bash
+
+      - name: Archive Test Reports
+        # !cancelled() 优于 always()：手动取消 run 时不再占着 runner 上传大文件
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android_test_reports
+          # TODO(perf): 这份 path 里包含 javac/kotlin-classes/full_jar 等海量小文件
+          #（是给 Sonar 用的编译产物）。upload-artifact 逐文件上传，数千个 class
+          # 会非常慢；建议先 tar 成单文件再上传（sonar 侧解包），通常能快一个量级。
+          path: |
+            **/build/test-results/**/TEST-*.xml
+            **/build/reports/jacoco/**/*.xml
+            **/build/intermediates/javac/debug*/**
+            **/build/intermediates/javac/internalDebug*/**
+            **/build/intermediates/full_jar/**/*.jar
+            **/build/tmp/kotlin-classes/debug*/**
+            **/build/tmp/kotlin-classes/internalDebug*/**
+            **/build/classes/**
+            **/build/libs/*.jar
+            **/build/reports/tests/**
+            **/build/outputs/unit_test_code_coverage/**/*.exec
+          if-no-files-found: ignore
+          retention-days: 1
+
+      # ══ 重构核心：Stage 一次性生成 manifest（逻辑名 ↔ 输出相对路径），
+      #    versionName 只在这里解析一次并已代入路径；Restore 与 sign matrix
+      #    都从 manifest 派生，publish job 不再需要解析 gradle.properties。══
+      - name: Stage unsigned APKs
+        id: stage
+        run: |
+          set -euo pipefail
+
+          VERSION_NAME=$(awk -F= '$1 == "versionName" { print $2 }' gradle.properties | tr -d '[:space:]')
+          if [[ -z "$VERSION_NAME" ]]; then
+            echo "versionName is missing from gradle.properties"
+            exit 1
+          fi
+
+          mkdir -p unsigned-apks
+
+          # 唯一事实来源：逻辑名 <TAB> app/build/outputs/apk 下的相对路径。
+          # 新增/删除 flavor 只改这里一处。
+          cat > unsigned-apks/manifest.tsv <<EOF
+          internal-debug	internal/debug/app-internal-debug.apk
+          internal-debug-androidTest	androidTest/internal/debug/app-internal-debug-androidTest.apk
+          tdinvesting-debug	tdinvesting/debug/TDWealthPreview-${VERSION_NAME}.apk
+          tdinvesting-debug-androidTest	androidTest/tdinvesting/debug/app-tdinvesting-debug-androidTest.apk
+          tdactivetrader-debug	tdactivetrader/debug/TDWealthProduction-${VERSION_NAME}.apk
+          tdactivetrader-debug-androidTest	androidTest/tdactivetrader/debug/app-tdactivetrader-debug-androidTest.apk
+          EOF
+
+          while IFS=$'\t' read -r name relpath; do
+            [[ -z "$name" ]] && continue
+            src="app/build/outputs/apk/$relpath"
+            if [[ ! -f "$src" ]]; then
+              echo "::error::Expected APK not produced by this build: $src"
+              exit 1
+            fi
+            cp "$src" "unsigned-apks/$name.apk"
+          done < unsigned-apks/manifest.tsv
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          # 供 sign job 动态 matrix：["internal-debug", ...]
+          echo "artifact_list=$(cut -f1 unsigned-apks/manifest.tsv | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Upload unsigned APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-apks
+          # 整目录上传：APK + manifest.tsv 一起走，publish 端直接消费 manifest
+          path: unsigned-apks/
+          if-no-files-found: error
+          retention-days: 1
+
+  sonar_check:
+    name: SonarQube Quality Check
+    needs: [build]
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+      actions: read
+      pull-requests: write
+    uses: ./.github/workflows/sonar.yml
+    with:
+      target_branch: ${{ github.ref_name }}
+      test_artifact_pattern: android_test_reports
+      sonar_project_key: 'TD-Universe:watrp-devex-tdmoband:'  # TODO(verify) 末尾冒号是否是有意的
+      sonar-gradle-task: sonar
+      is_release: false
+    secrets:
+      sonar_analysis_token: ${{ secrets.SQ_PROJECT_ANALYSIS_TOKEN }}
+      sonar_quality_gate_token: ${{ secrets.SQ_PAT }}
+
+  sign:
+    name: Sign ${{ matrix.artifact }}
+    needs: [build]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 动态 matrix：从 build 的 manifest 派生，删掉了原来手写的 6 项清单
+        artifact: ${{ fromJSON(needs.build.outputs.artifact_list) }}
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    steps:
+      - name: Download unsigned APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-apks
+          path: ${{ github.workspace }}/unsigned-apks
+
+      # 幂等性：signed-apks 可能残留上一次 run 的产物，先清再建
+      - name: Prepare signed APK directory
+        run: |
+          rm -rf "${{ github.workspace }}/signed-apks"
+          mkdir -p "${{ github.workspace }}/signed-apks"
+        shell: bash
+
+      # 修复：不再 pin 在可变的 feature 分支上（可被 force-push / 删除，不可复现）
+      - name: Sign APK
+        uses: TD-Universe/common-actions/signing-service@v1  # TODO: SERPOMF-41036 合并后 pin 到正式 tag/SHA
+        with:
+          platform: android
+          artifact_path: ${{ github.workspace }}/unsigned-apks/${{ matrix.artifact }}.apk
+          output_path: ${{ github.workspace }}/signed-apks/${{ matrix.artifact }}.apk
+          android_keystore: androidReleaseKeyStore
+          android_keystore_password: androidReleaseKeyStorePassword
+          android_key_alias: androidReleaseKeyAlias
+          android_key_password: androidReleaseKeyAliasPassword
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-${{ matrix.artifact }}
+          path: ${{ github.workspace }}/signed-apks/${{ matrix.artifact }}.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish signed APKs
+    needs: [build, sign]
+    timeout-minutes: 60
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 幂等性关键：publish job 用 -Ptd.skipPublicationBuild=true 让 gradle
+      # 直接发布 outputs 目录里的现成文件——那么 outputs 里绝不能有上一次 run
+      # 的残留，否则会把陈旧甚至未签名的 APK 发布出去。先整目录清掉。
+      - name: Clean stale APK outputs
+        run: rm -rf app/build/outputs/apk signed-apks
+        shell: bash
+
+      - name: Download signed APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/signed-apks
+
+      - name: Download APK manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-apks
+          path: ${{ github.workspace }}/unsigned-apks
+
+      # ══ 重构核心：Restore 变成 manifest 的反向循环。
+      #    不再重复 6 行 mkdir + 6 行 cp，不再重复解析 versionName——
+      #    manifest 里的路径在 Stage 时就已代入版本号。══
+      - name: Restore signed APKs to publication paths
+        run: |
+          set -euo pipefail
+
+          while IFS=$'\t' read -r name relpath; do
+            [[ -z "$name" ]] && continue
+            src="signed-apks/$name.apk"
+            dest="app/build/outputs/apk/$relpath"
+            if [[ ! -f "$src" ]]; then
+              echo "::error::Signed APK missing from artifacts: $src"
+              exit 1
+            fi
+            mkdir -p "$(dirname "$dest")"
+            cp "$src" "$dest"
+          done < unsigned-apks/manifest.tsv
+        shell: bash
+
+      - name: Update Gradle Wrapper
+        run: ./update-gradle-wrapper.sh
+        shell: bash
+
+      - name: Bundle Install
+        env:
+          NPID_TOKEN: ${{ secrets.GHTOKEN }}
+        run: |
+          echo "Ruby executable: $(command -v ruby)"
+          ruby --version
+          # 用 RBENV_VERSION 做单一来源，不再把 3.1.6 硬编码第二遍
+          ruby -e 'abort "Ruby #{ENV["RBENV_VERSION"]} is required" unless RUBY_VERSION == ENV["RBENV_VERSION"]'
+          bundle config set --local force_ruby_platform false
+          bundle install
+        shell: bash
+
+      - name: Get Baseline Commit
+        env:
+          # 修复：token 不再以 '${{ }}' 内联进命令行（自托管机器上进程参数对
+          # 同机进程可见），改走环境变量；仓库名用 github.repository 不写死
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASELINE_COMMIT=$(bundle exec github-baseline-commit \
+            -t "$GH_TOKEN" \
+            -r "${{ github.repository }}" \
+            -w "${{ github.workflow_ref }}" \
+            -h "${{ github.sha }}")
+          echo "BASELINE_COMMIT=$BASELINE_COMMIT" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Publish Android
+        env:
+          tdNexusUsername: ${{ secrets.NEXUS_ID }}
+          tdNexusPassword: ${{ secrets.NEXUS_PASS }}
+          USERNAME: ${{ secrets.CONFLUENCE_ID }}
+          PASSWORD: ${{ secrets.CONFLUENCE_PASS }}
+          # 注：re-run 时 run_number 不变——请确认 Nexus 端对已存在版本是覆盖
+          # 还是 409，决定 re-run publish 是否安全（幂等）
+          BUILD_NUMBER: ${{ github.run_number }}
+          GIT_COMMIT: ${{ github.sha }}
+          GIT_PREVIOUS_SUCCESSFUL_COMMIT: ${{ env.BASELINE_COMMIT }}
+          GIT_BRANCH: ${{ github.ref_name }}
+          BUILD_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_SUFFIX: ${{ needs.build.outputs.artifact_suffix }}
+          # 复用 build 算好的参数，删掉了原来在这里重复的 if 块
+          ADDITIONAL_PARAMS: ${{ needs.build.outputs.additional_params }}
+        run: |
+          ./gradlew -PtdBuild=true \
+            -Ptd.artifactIdSuffix="$ARTIFACT_SUFFIX" \
+            -Ptd.skipPublicationBuild=true \
+            $ADDITIONAL_PARAMS --info --stacktrace \
+            :app:publish :app:publishReleaseNotes
+        shell: bash
+
+      - name: Share Android Confluence Link
+        run: |
+          FILE="app/build/release-notes-link.html"
+          if [[ ! -f "$FILE" ]]; then
+            echo "Confluence release notes link was not generated" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          RELEASE_NOTES_URL=$(grep '<title>Release Notes:' "$FILE" | cut -d' ' -f3 | head -1)
+          if [[ -z "$RELEASE_NOTES_URL" ]]; then
+            echo "Confluence release notes link is missing from $FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "### Confluence Release Notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "$RELEASE_NOTES_URL" >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
