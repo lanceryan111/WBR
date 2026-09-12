@@ -1,0 +1,359 @@
+name: Integration Build
+# Standard build flow for non-release builds (master, project/*, concept/* branches).
+#
+# 本文件基于截图重建并重构。凡是截图里被截断、无法确认的内容都标了 "TODO(verify)"。
+
+on:
+  push:
+    branches:
+      - master
+      - 'project/**'
+      - 'concept/**'
+  workflow_dispatch:
+    inputs:
+      disable_build_cache:
+        description: Disables gradle and build cache
+        type: boolean
+        default: false
+
+# ── 最小权限原则 ─────────────────────────────────────────────
+# 原文件在 workflow 级别给了 contents: write + pull-requests: write，
+# 所有 job（包括第三方 action）都继承了写权限。改为默认只读，
+# 需要写权限的 job（sonar）单独声明。
+permissions:
+  contents: read
+
+# ── 修复：原文件注释说“取消进行中的构建”，但漏了 cancel-in-progress，
+#    默认行为是排队而不是取消 ────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+# ── 公共 env 提到 workflow 级别，避免 build / publish 两处重复维护 ──
+env:
+  LANG: en_US.UTF-8
+  # TODO(design): PATH 与 JAVA_HOME 硬编码了 /Users/ciusr 和具体 JDK 版本，
+  # 强耦合到某台 runner 的镜像。建议放进 runner 镜像的 profile 或一个
+  # 受版本管理的 setup 脚本（如 ./export_env/ci-env.sh），workflow 里不写死。
+  JAVA_HOME: /Library/Java/JavaVirtualMachines/jbrsdk-21.0.3-osx-aarch64-b509.11/Contents/Home
+  FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: 600
+  EXCLUDE_TASKS: '--exclude-task cocoapodsInstall --exclude-task simulatorKill'
+  FASTLANE_HIDE_TIMESTAMP: 1
+
+jobs:
+  build:
+    name: Integration Build (${{ matrix.configuration }}-${{ matrix.platform }})
+    permissions:
+      contents: read
+      id-token: write
+    # 自托管 macOS runner 上 xcodebuild 偶发挂死，必须设置超时兜底
+    timeout-minutes: 90
+    strategy:
+      # Don't cancel the other matrix builds if one configuration fails.
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: ClientPreview
+            platform: Sim
+            prov_profile: TD_Active_Trader
+          - configuration: ClientPreview
+            platform: Device
+            prov_profile: TD_Active_Trader
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    # 注意：matrix job 的 outputs 是“最后写入的 leg 获胜”。
+    # 这里所有输出在两个 leg 上的取值都是确定且相同的（与 platform 无关），
+    # 所以可以接受；如果以后要输出与 matrix 相关的值，请拆一个独立的 setup job。
+    outputs:
+      publish_param: ${{ steps.setup-publishing.outputs.publish_param }}
+      BASELINE_COMMIT: ${{ steps.find-baseline-commit.outputs.BASELINE_COMMIT }}
+      additional_params: ${{ steps.setup-vars.outputs.ADDITIONAL_PARAMS }}
+      sonar_reference_branch: ${{ steps.setup-vars.outputs.SONAR_REF_BRANCH }}
+    steps:
+      # ── 修复：原正则 ^(refs/heads\/)?(master|project|concept)\/* 中
+      #    \/* 是“0 个或多个斜杠”，且末尾未锚定，"conceptual-x" 这类分支也会通过。
+      #    另外把 ${{ }} 从脚本内联改成 env 传参，杜绝分支名注入/断词问题。──
+      - name: Validate branch type against workflow
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ ! "$REF" =~ ^refs/heads/(master$|project/|concept/) ]]; then
+            echo "Triggered branch type is not supported for this workflow"
+            exit 1
+          fi
+        shell: bash
+
+      # If it's a project or concept branch, get branch name to be used for Nexus version suffix.
+      # 修复：startsWith 'project'（无斜杠）会匹配 projectx 之类分支；补上斜杠。
+      # 修复：不再把 ${{ github.ref_name }} 内联进 bash（分支名可注入），改用环境变量 + 纯 bash 展开。
+      - name: Parse Publishing Params
+        id: setup-publishing
+        if: startsWith(github.ref_name, 'project/') || startsWith(github.ref_name, 'concept/')
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "publish_param=${REF_NAME##*/}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Calculate Reference Sonarqube Branch from Common Actions
+        id: common-actions-sonar-ref-branch
+        uses: TD-Universe/common-actions/get-sonarqube-new-code-reference-branch@v1
+
+      - name: Set Environment Variable
+        id: setup-vars
+        env:
+          PUBLISH_PARAM: ${{ steps.setup-publishing.outputs.publish_param }}
+          DISABLE_BUILD_CACHE: ${{ inputs.disable_build_cache }}
+          SONAR_REF_FROM_ACTION: ${{ steps.common-actions-sonar-ref-branch.outputs.new-code-reference-branch }}
+        run: |
+          ADDITIONAL_PARAMS="-Ptd.release=false -PartifactIdSuffix=${PUBLISH_PARAM}"  # TODO(verify) 行尾在截图中被截断
+
+          if [[ "${{ runner.debug }}" == "1" ]]; then
+            ADDITIONAL_PARAMS="$ADDITIONAL_PARAMS --stacktrace"
+          fi
+
+          if [[ "$DISABLE_BUILD_CACHE" == "true" ]]; then
+            ADDITIONAL_PARAMS="$ADDITIONAL_PARAMS --no-build-cache"
+          fi
+
+          # 原文件里有 pull_request 分支判断，但本 workflow 只有 push 和
+          # workflow_dispatch 两种触发，event_name 永远不会是 pull_request——死代码，已删。
+          SONAR_REF_BRANCH="$SONAR_REF_FROM_ACTION"
+
+          echo "ADDITIONAL_PARAMS=$ADDITIONAL_PARAMS" >> "$GITHUB_OUTPUT"
+          echo "SONAR_REF_BRANCH=$SONAR_REF_BRANCH" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 幂等性关键：自托管 runner 的工作区不会自动清理，
+          # clean: true 保证每次运行从干净状态开始（重跑结果一致）。
+          clean: true
+
+      # ── 幂等性修复：unzip 不带 -o 时，目标文件已存在会交互式询问并挂起/失败。
+      #    先删目标目录再 -o 解压，重跑安全。──
+      - name: Unzip Dependencies
+        working-directory: ${{ github.workspace }}
+        run: |
+          rm -rf dxmobile \
+                 TDWealth/JRE.xcframework/ios-arm64/JRE.framework/JRE.framework \
+                 TDWealth/JRE.xcframework/ios-arm64_x86_64-simulator/
+          unzip -oq dxmobile.zip -d dxmobile/
+          unzip -oq TDWealth/JRE.xcframework/ios-arm64/JRE.framework/JRE.zip -d TDWealth/JRE.xcframework/ios-arm64/JRE.framework
+          unzip -oq TDWealth/JRE.xcframework/ios-arm64_x86_64-simulator.zip -d TDWealth/JRE.xcframework/ios-arm64_x86_64-simulator/
+        shell: bash
+
+      - name: Bundle Install
+        env:
+          NPID_TOKEN: ${{ secrets.GHTOKEN }}
+        run: |
+          bundle config set force_ruby_platform false
+          bundle install
+        shell: bash
+
+      # Release notes called in publish-confluence look for "GIT_PREVIOUS_SUCCESSFUL_COMMIT"
+      # to get range of commits, and jira tickets.
+      # ── 修复：job outputs 引用了 steps.find-baseline-commit，但截图中该 step
+      #    没有 id —— 缺 id 时 output 永远为空。补上 id。──
+      # ── 修复：仓库名不再硬编码，用 github.repository。──
+      - name: Find Last Successful Commit
+        id: find-baseline-commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "BASELINE_COMMIT=$(bundle exec github-baseline-commit -t "$GH_TOKEN" -r "${{ github.repository }}" -w "${{ github.workflow_ref }}" -h "${{ github.sha }}")" >> "$GITHUB_OUTPUT"
+          # TODO(verify) 行尾参数在截图中被截断，请对照原文件补齐
+        shell: bash
+
+      # ── 设计修复：coverage 与 platform 无关，原来在两个 matrix leg 各跑一遍，
+      #    白占一台 macOS runner 半场时间；限定只在 Sim leg 跑。
+      #    这同时修复了一个必然报错的 bug：upload-artifact@v4 不允许两个
+      #    matrix leg 上传同名 artifact（tests_reports_UnitTestPlan 会 409 冲突）。──
+      - name: Generate Code Coverage
+        if: matrix.platform == 'Sim'
+        run: |
+          source ./export_env/insprint/tdwealth.sh
+          bundle exec fastlane coverage
+          bundle exec fastlane test_coverage_report
+        shell: bash
+
+      - name: Export Test Artifacts
+        if: matrix.platform == 'Sim'
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: tests_reports_UnitTestPlan
+          path: build/reports/coverage/   # 原来的 *.* 会漏掉无扩展名文件，直接传目录
+
+      - name: Build Unsigned App
+        working-directory: ${{ github.workspace }}
+        run: |
+          bundle exec fastlane perform_unsigned_build platform:${{ matrix.platform }} configuration:${{ matrix.configuration }}
+        shell: bash
+
+      - name: Locate Unsigned IPA
+        id: locate-ipa
+        working-directory: ${{ github.workspace }}
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          # sort 保证多个 ipa 时选取结果确定（原 find | head -1 顺序不保证）
+          IPA_PATH=$(find dist -name '*.ipa' | sort | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "No unsigned IPA found for configuration $CONFIGURATION"
+            exit 1
+          fi
+          echo "ipa_path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Upload Unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TDWealth_unsigned_${{ matrix.configuration }}-${{ matrix.platform }}
+          path: ${{ github.workspace }}/${{ steps.locate-ipa.outputs.ipa_path }}
+          if-no-files-found: error
+
+  ios_sonar_check:
+    name: SonarQube Quality Check
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+      actions: read
+      pull-requests: write
+    uses: ./.github/workflows/macos-sonar.yml
+    with:
+      test_artifact_pattern: tests_reports_UnitTestPlan
+      test_artifact_path: build/reports/coverage
+      # 本 workflow 不会由 PR 触发，github.head_ref 永远为空，|| 是死代码——直接用 ref_name
+      target_branch: ${{ github.ref_name }}
+      sonar_project_key: 'TD-Universe:watrp-devex-tdmobios:'  # TODO(verify) 末尾冒号看起来可疑，确认 SonarQube 项目 key 是否真的以 ':' 结尾
+      new-code-reference-branch: ${{ needs.build.outputs.sonar_reference_branch }}
+      sonar-gradle-task: sonar
+    secrets: inherit  # TODO(verify) 截图在 "secrets:" 处截断，按原文件填写
+
+  resign:
+    name: Resign
+    needs: [build]
+    timeout-minutes: 30
+    strategy:
+      # Don't cancel the other matrix builds if one configuration fails.
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: ClientPreview
+            platform: Sim
+            prov_profile: TD_Active_Trader
+          - configuration: ClientPreview
+            platform: Device
+            prov_profile: TD_Active_Trader
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    steps:
+      - name: Download Unsigned IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: TDWealth_unsigned_${{ matrix.configuration }}-${{ matrix.platform }}
+          path: ${{ github.workspace }}/unsigned
+
+      - name: Locate Unsigned IPA
+        id: locate-ipa
+        working-directory: ${{ github.workspace }}
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          IPA_PATH=$(find unsigned -name '*.ipa' | sort | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "No unsigned IPA found for configuration $CONFIGURATION"
+            exit 1
+          fi
+          echo "ipa_path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # ── 修复：原来 pin 在 @feature/SERPOMF-41036-Signing-Service 功能分支上。
+      #    功能分支是可变引用，随时会被 force-push 或删除，构建不可复现。
+      #    合并后改 pin 到 tag（最好是 commit SHA）。──
+      - name: Resign App
+        uses: TD-Universe/common-actions/signing-service@v1  # TODO: 等 SERPOMF-41036 合并后 pin 到正式 tag / SHA
+        with:
+          platform: ios
+          artifact_path: ${{ github.workspace }}/${{ steps.locate-ipa.outputs.ipa_path }}
+          output_path: ${{ github.workspace }}/TDWealth_${{ matrix.configuration }}-${{ matrix.platform }}.ipa
+          ios_provisioning_profile: ${{ matrix.prov_profile }}
+
+      - name: Upload Resigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TDWealth_${{ matrix.configuration }}-${{ matrix.platform }}.ipa
+          path: ${{ github.workspace }}/TDWealth_${{ matrix.configuration }}-${{ matrix.platform }}.ipa
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    # ── 关键 bug 修复：原文件是 needs: [resign]，但下面引用了
+    #    needs.build.outputs.*。GitHub Actions 的 needs 上下文只包含
+    #    直接列在 needs 里的 job，所以 additional_params 和
+    #    GIT_PREVIOUS_SUCCESSFUL_COMMIT 在原文件里全部是空字符串——
+    #    gradlew 拿不到参数、release notes 拿不到 commit 范围。──
+    needs: [build, resign]
+    timeout-minutes: 30
+    runs-on:
+      group: cad-mob-macos
+      labels: [ "self-hosted", "macOS" ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Download all resigned IPAs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TDWealth_*.ipa
+          merge-multiple: true
+          path: ${{ github.workspace }}/dist
+
+      - name: Publish iOS
+        working-directory: ${{ github.workspace }}
+        env:
+          tdNexusUsername: ${{ secrets.NEXUS_ID }}
+          tdNexusPassword: ${{ secrets.NEXUS_PASS }}
+          USERNAME: ${{ secrets.CONFLUENCE_ID }}
+          PASSWORD: ${{ secrets.CONFLUENCE_PASS }}
+          # 注：re-run 同一个 run 时 run_number 不变，重发布会用同一版本号——
+          # 这是幂等的前提是 publish 任务对“版本已存在”做 skip 或覆盖，
+          # 请确认 gradle publish 端的行为（否则 re-run 会 409）。
+          VERSION_NUMBER: ${{ github.run_number }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          GIT_COMMIT: ${{ github.sha }}
+          GIT_PREVIOUS_SUCCESSFUL_COMMIT: ${{ needs.build.outputs.BASELINE_COMMIT }}
+          GIT_BRANCH: ${{ github.ref_name }}
+          BUILD_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
+          ADDITIONAL_PARAMS: ${{ needs.build.outputs.additional_params }}
+        shell: bash
+        run: |
+          # 原文件把 ${{ ... }} 直接内联进命令行；改为 env 传入后再展开
+          ./gradlew $ADDITIONAL_PARAMS publish
+
+      - name: Share iOS Confluence Link
+        run: |
+          FILE=build/release-notes-link.html
+          if [ -f "$FILE" ]; then
+            echo "### Confluence Release Notes:" >> "$GITHUB_STEP_SUMMARY"
+            echo "$(grep "<title>Release Notes:" "$FILE" | cut -d" " -f3)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Could not find release notes link" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        shell: bash
+
+# ── 已删除的内容 ─────────────────────────────────────────────
+# 1. jobs.<build|publish>.env 里的 baseBranchName: origin/${{ inputs.target_branch }}
+#    —— 本 workflow 的 workflow_dispatch 根本没有声明 target_branch 输入，
+#    该值永远是 "origin/"（疑似从 release workflow 复制来的残留）。
+#    如确实需要，请在 workflow_dispatch.inputs 里声明并给默认值。
+# 2. 注释掉的 schedule cron —— 死代码交给 git history 记住即可；
+#    需要 nightly 时建议单独建一个 nightly workflow 调用 workflow_call 复用本流程。
