@@ -1,0 +1,180 @@
+---
+# ============================================================================
+# tasks/fetch_runtime_config.yml
+#
+# Pull the runtime-config tarball for THIS service from the raw Nexus repo,
+# merge defaults.yml + <env>-config.yml, and override the group_vars values
+# with set_fact. set_fact outranks group_vars, so every task after this one in
+# the play (deploy_scripts, deploy_config, ...) sees the Nexus values instead
+# of the committed defaults. Skip this task (don't call its tag) and the
+# committed defaults stand untouched.
+#
+# Runs ONCE per play, not per app: one service folder in wbr-app-config = one
+# tarball, and the YAML inside is keyed by app name, so a single fetch covers
+# every app in app_list.
+#
+# Tarball layout (produced by package_app_config in wbr-app-config):
+#   defaults.yml, dev-config.yml, pat-config.yml, prod-config.yml, BUILD-INFO.txt
+#
+# YAML shape inside each file - top-level keys are APP names:
+#   ic-batch:
+#     JVM_ARGS: ["-Xms1024m", "-Xmx2048m"]
+#     RUN_ARGS: ["D"]
+#     ENV_VARS: { ENV: pat, NAME: foo }
+#
+# Vars (group_vars or -e; see defaults below):
+#   runtime_config_service      wbr-app-config folder name = tarball name,
+#                               e.g. wbr_wbrsvc-wbr-thematic-ingestion
+#   runtime_config_nexus_base   https://rp.td.com/repository/<repo>/W000WBR/ansible/app_runtime_config_params
+#   runtime_config_version      blank -> read the LATEST marker; else exact version
+#   runtime_config_env_prefix   defaults to config_environment (dev/pat/drp/prod)
+#   nexus_username / nexus_password
+#
+# Overrides (per app key found in the merged YAML):
+#   environment_jvm_properties[app]   <- JVM_ARGS
+#   environment_run_args[app]         <- RUN_ARGS
+#   environment_app_env_vars[app]     <- ENV_VARS
+#
+# Reads files with slurp rather than include_vars on purpose: include_vars
+# reads from the CONTROL node, but the tarball lands on the TARGET. With
+# ansible_connection=local (CADP) those are the same box; over ssh (DEV_GH)
+# they are not. slurp always reads from the target.
+# ============================================================================
+
+- name: Fetch runtime config from Nexus
+  block:
+
+    - name: Resolve runtime-config settings
+      ansible.builtin.set_fact:
+        _rc_service: "{{ runtime_config_service }}"
+        _rc_base: "{{ runtime_config_nexus_base | regex_replace('/$', '') }}/{{ runtime_config_service }}"
+        _rc_env_prefix: "{{ runtime_config_env_prefix | default(config_environment) }}"
+        _rc_pinned: "{{ runtime_config_version | default('') | trim }}"
+
+    - name: Create temp dir for runtime config
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: "runtime-config-{{ _rc_service }}-"
+      register: _rc_tmp
+
+    # ---- resolve version --------------------------------------------------
+    # A raw repo has no maven-metadata.xml, so "latest" is a marker file that
+    # upload_app_config writes next to every tarball. Pin with
+    # -e runtime_config_version=20260904.13 to bypass it (do this for prod).
+    - name: Read LATEST marker from Nexus
+      ansible.builtin.uri:
+        url: "{{ _rc_base }}/LATEST"
+        url_username: "{{ nexus_username }}"
+        url_password: "{{ nexus_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _rc_latest
+      when: _rc_pinned | length == 0
+
+    - name: Set resolved version
+      ansible.builtin.set_fact:
+        _rc_version: "{{ _rc_pinned if _rc_pinned | length > 0 else (_rc_latest.content | trim) }}"
+
+    - name: Fail if version could not be resolved
+      ansible.builtin.fail:
+        msg: "runtime config version is empty for {{ _rc_service }} - LATEST marker missing or blank?"
+      when: _rc_version | length == 0
+
+    # ---- download + extract ----------------------------------------------
+    - name: "Download {{ _rc_service }}-{{ _rc_version }}.tar.gz"
+      ansible.builtin.get_url:
+        url: "{{ _rc_base }}/{{ _rc_service }}-{{ _rc_version }}.tar.gz"
+        dest: "{{ _rc_tmp.path }}/config.tar.gz"
+        url_username: "{{ nexus_username }}"
+        url_password: "{{ nexus_password }}"
+        force_basic_auth: true
+        mode: "0600"
+
+    - name: Extract runtime config
+      ansible.builtin.unarchive:
+        src: "{{ _rc_tmp.path }}/config.tar.gz"
+        dest: "{{ _rc_tmp.path }}"
+        remote_src: true
+
+    - name: Check environment config file exists
+      ansible.builtin.stat:
+        path: "{{ _rc_tmp.path }}/{{ _rc_env_prefix }}-config.yml"
+      register: _rc_env_file
+
+    # Fail loudly. Silently deploying defaults-only because a file got renamed
+    # is exactly the bug you find at 2am in prod.
+    - name: Fail if environment config is missing from the tarball
+      ansible.builtin.fail:
+        msg: >-
+          {{ _rc_env_prefix }}-config.yml not found in
+          {{ _rc_service }}-{{ _rc_version }}.tar.gz. Check runtime_config_env_prefix
+          (defaults to config_environment) against the filenames in wbr-app-config.
+      when: not _rc_env_file.stat.exists
+
+    # ---- load + merge -----------------------------------------------------
+    - name: Read defaults.yml
+      ansible.builtin.slurp:
+        src: "{{ _rc_tmp.path }}/defaults.yml"
+      register: _rc_defaults_raw
+
+    - name: "Read {{ _rc_env_prefix }}-config.yml"
+      ansible.builtin.slurp:
+        src: "{{ _rc_tmp.path }}/{{ _rc_env_prefix }}-config.yml"
+      register: _rc_env_raw
+
+    - name: Merge defaults with environment config (env wins, nested keys merge)
+      ansible.builtin.set_fact:
+        _rc_merged: >-
+          {{ (_rc_defaults_raw.content | b64decode | from_yaml | default({}, true))
+             | combine(_rc_env_raw.content | b64decode | from_yaml | default({}, true), recursive=True) }}
+
+    # ---- override group_vars ---------------------------------------------
+    # set_fact > group_vars in precedence, so from here on the play uses these.
+    - name: Override environment_jvm_properties per app
+      ansible.builtin.set_fact:
+        environment_jvm_properties: >-
+          {{ environment_jvm_properties | default({})
+             | combine({ item.key: item.value.JVM_ARGS }) }}
+      loop: "{{ _rc_merged | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.JVM_ARGS is defined
+
+    - name: Override environment_run_args per app
+      ansible.builtin.set_fact:
+        environment_run_args: >-
+          {{ environment_run_args | default({})
+             | combine({ item.key: item.value.RUN_ARGS }) }}
+      loop: "{{ _rc_merged | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.RUN_ARGS is defined
+
+    - name: Override environment_app_env_vars per app
+      ansible.builtin.set_fact:
+        environment_app_env_vars: >-
+          {{ environment_app_env_vars | default({})
+             | combine({ item.key: item.value.ENV_VARS }) }}
+      loop: "{{ _rc_merged | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.ENV_VARS is defined
+
+    - name: Runtime config applied
+      ansible.builtin.debug:
+        msg:
+          service: "{{ _rc_service }}"
+          version: "{{ _rc_version }}"
+          env_file: "{{ _rc_env_prefix }}-config.yml"
+          apps: "{{ _rc_merged | dict2items | map(attribute='key') | list }}"
+          environment_jvm_properties: "{{ environment_jvm_properties | default({}) }}"
+
+  always:
+    # Runs even when a step above failed, so a bad tarball never leaves
+    # credentials-fetched files lying around in /tmp.
+    - name: Clean up runtime config temp dir
+      ansible.builtin.file:
+        path: "{{ _rc_tmp.path }}"
+        state: absent
+      when: _rc_tmp is defined and _rc_tmp.path is defined

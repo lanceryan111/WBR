@@ -29,18 +29,24 @@
      `deploy_app_details.name`. If `application` is a real var defined
      somewhere I could not see, switch it back.
 
-  4. Values arrive as JSON in env vars, decoded in group_vars - see
-     group_vars_snippet.yml.
+  4. Values come from three per-app dicts (environment_jvm_properties,
+     environment_run_args, environment_app_env_vars). group_vars holds the
+     committed defaults; tasks/fetch_runtime_config.yml overrides them from
+     the Nexus tarball when its tag is invoked.
 
   Renders correctly under Ansible's Jinja defaults (trim_blocks=true,
   lstrip_blocks=false).
 #}
-{# Resolve injected config. `| default(..., true)` also catches the empty
-   values you get when the deploy runs without the config workflow having
-   set anything, so this template still renders standalone. #}
-{% set cfg_env_vars = app_config_env_vars | default({}, true) %}
-{% set cfg_jvm_args = app_config_jvm_args | default([], true) %}
-{% set cfg_run_args = app_config_run_args | default([], true) %}
+{# Resolve per-app config. These dicts are keyed by app name - the same shape
+   your group_vars already use for environment_jvm_properties (PAT.yml:
+   environment_jvm_properties.ic-batch). fetch_runtime_config.yml overrides
+   them with the Nexus tarball via set_fact; skip that tag and the committed
+   group_vars values render instead. .get() so a missing app key falls
+   through to the fallback rather than erroring. #}
+{% set _app = deploy_app_details.name %}
+{% set cfg_jvm_args = (environment_jvm_properties | default({})).get(_app, []) %}
+{% set cfg_run_args = (environment_run_args | default({})).get(_app, []) %}
+{% set cfg_env_vars = (environment_app_env_vars | default({})).get(_app, {}) %}
 {# Your previous hardcoded heap settings, now only used when the config
    supplies no JVM args. This is the "覆盖掉 default 的值" behaviour: the
    role default stands until wbr-app-config overrides it. #}
