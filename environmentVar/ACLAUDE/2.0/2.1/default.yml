@@ -1,0 +1,23 @@
+# WBR FRD — service 各环境运行时的通用值（优先级第 2 层）
+#
+# 优先级（低 -> 高）：
+#   1. gh-lib group_vars/all.yml
+#   2. 本文件                          <- 通用值
+#   3. gh-lib group_vars/<ENV>.yml     <- 环境特定，能盖过本文件
+#   4. 本目录的 <env>-config.yml       <- 最高
+#
+# 所以这里只放"不管哪个环境都一样"的值。任何按环境变的东西写进
+# <env>-config.yml —— 写在这里的话会被 group_vars/<ENV>.yml 盖掉。
+#
+# 必须跟 <env>-config.yml 一样按 app 名嵌套。
+# 这个文件必须存在（打包工具靠它识别 service 文件夹），但可以只有注释。
+
+Fraudster:
+  ENV_VARS:
+    LOG_PATH: /app/logs/WebLogs/webbroker-notification
+
+Solacer: {}
+
+Cleaner: {}
+
+Mailer: {}
