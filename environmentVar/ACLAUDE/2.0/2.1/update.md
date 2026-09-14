@@ -1,0 +1,344 @@
+三个文件的完整内容，直接复制：
+
+## 1. `wbr_actions/ansible/wbr_wbrsvc-fraud-detection/tasks/fetch_runtime_config.yml`
+
+```yaml
+---
+# ============================================================================
+# tasks/fetch_runtime_config.yml
+#
+# 把这个 service 的 runtime-config tarball 从 raw Nexus 拉下来，按优先级覆盖
+# group_vars 的值。不调这个 tag，group_vars 原封不动。
+#
+# ---- 优先级（低 -> 高）----------------------------------------------------
+#   1. group_vars/all.yml              gh-lib 通用默认
+#   2. app-config defaults.yml         service 各环境运行时的通用值
+#   3. group_vars/<ENV>.yml            gh-lib 环境特定值 (DEV_GH / DEV / PAT / DRP / PRD)
+#   4. app-config <env>-config.yml     该环境的覆盖值  <- 最高
+#
+# 注意 2 在 3 下面：defaults.yml 是通用值，环境特定的 group_vars 应该能盖过它；
+# 只有 app-config 里明确写了该环境的值（第 4 层）才盖得回去。
+#
+# 实现上这意味着 defaults.yml 和 <env>-config.yml 不能先合并成一份再套用 ——
+# 那样会让通用值一起骑到 group_vars 头上。所以分两次：defaults 垫在下面，
+# env-config 压在上面。
+#
+# ---- 合并语义 -------------------------------------------------------------
+#   ENV_VARS  dict  -> 按 key 递归合并。上层有同名 key 就覆盖，没有的 key
+#                      保留下层的值。DEV_GH.yml 里的 SSL 变量不会因为
+#                      app-config 加了个 SPRING_PROFILES_ACTIVE 而消失。
+#   JVM_ARGS  list  -> 按 app 整体替换。列表没法"按 key 合并"，上层写了某个
+#   RUN_ARGS  list     app 的列表就整份取代下层该 app 的列表。
+#
+# ---- tarball 内容（package_app_config 产出）-------------------------------
+#   defaults.yml, dev-config.yml, pat-config.yml, prod-config.yml, BUILD-INFO.txt
+#   每个文件顶层 key 是 APP 名：
+#     Fraudster:
+#       JVM_ARGS: ["-Xms1024m", "-Xmx2048m"]
+#       RUN_ARGS: ["--server.port=8443"]
+#       ENV_VARS: {SPRING_PROFILES_ACTIVE: pat}
+#
+# ---- Vars (group_vars/all.yml) --------------------------------------------
+#   runtime_config_service      app-config 里的文件夹名 = tarball 名
+#   runtime_config_nexus_base   {{ nexus_base_url }}/repository/<raw repo>/W000WBR/ansible/app_runtime_config_params
+#   runtime_config_version      留空 -> 读 LATEST；否则用指定版本
+#   runtime_config_env_prefix   默认取 config_environment。DEV_GH 和 DEV 的
+#                               config_environment 都是 dev，所以两个 group
+#                               都会拉 dev-config.yml，符合预期。
+#
+# Nexus 凭据不放 group_vars，从 GH Action / CADP 已经 export 好的环境变量读，
+# 跟 all.yml 读 ARTIFACT_VERSION / JDK_VERSION 一个写法。临时覆盖：
+#   -e nexus_username=... -e nexus_password=...
+#
+# 用 slurp 而不是 include_vars：include_vars 从**控制节点**读，但 tarball 落在
+# **目标机**。CADP 上 connection=local 两者是同一台，走 ssh 就不是了。
+# ============================================================================
+
+- name: Fetch runtime config from Nexus
+  block:
+
+    - name: Resolve runtime-config settings
+      ansible.builtin.set_fact:
+        _rc_service: "{{ runtime_config_service }}"
+        _rc_base: "{{ runtime_config_nexus_base | regex_replace('/$', '') }}/{{ runtime_config_service }}"
+        _rc_env_prefix: "{{ runtime_config_env_prefix | default(config_environment) }}"
+        _rc_pinned: "{{ runtime_config_version | default('') | trim }}"
+
+    - name: Resolve Nexus credentials from environment
+      ansible.builtin.set_fact:
+        _rc_user: "{{ nexus_username | default(lookup('ansible.builtin.env', 'NEXUS_USERNAME'), true) }}"
+        _rc_pass: "{{ nexus_password | default(lookup('ansible.builtin.env', 'NEXUS_PASSWORD'), true) }}"
+      no_log: true
+
+    - name: Fail if Nexus credentials are missing
+      ansible.builtin.fail:
+        msg: "NEXUS_USERNAME / NEXUS_PASSWORD not set in the environment and no -e override given"
+      when: _rc_user | length == 0 or _rc_pass | length == 0
+
+    - name: Create temp dir for runtime config
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: "runtime-config-{{ _rc_service }}-"
+      register: _rc_tmp
+
+    # raw 仓库没有 maven-metadata.xml，所以 "latest" 是 upload_app_config 在每个
+    # tarball 旁边写的一个标记文件。prod 建议 -e runtime_config_version=... 锁版本。
+    - name: Read LATEST marker from Nexus
+      ansible.builtin.uri:
+        url: "{{ _rc_base }}/LATEST"
+        url_username: "{{ _rc_user }}"
+        url_password: "{{ _rc_pass }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _rc_latest
+      when: _rc_pinned | length == 0
+
+    - name: Set resolved version
+      ansible.builtin.set_fact:
+        _rc_version: "{{ _rc_pinned if _rc_pinned | length > 0 else (_rc_latest.content | trim) }}"
+
+    - name: Fail if version could not be resolved
+      ansible.builtin.fail:
+        msg: "runtime config version is empty for {{ _rc_service }} - LATEST marker missing or blank?"
+      when: _rc_version | length == 0
+
+    - name: "Download {{ _rc_service }}-{{ _rc_version }}.tar.gz"
+      ansible.builtin.get_url:
+        url: "{{ _rc_base }}/{{ _rc_service }}-{{ _rc_version }}.tar.gz"
+        dest: "{{ _rc_tmp.path }}/config.tar.gz"
+        url_username: "{{ _rc_user }}"
+        url_password: "{{ _rc_pass }}"
+        force_basic_auth: true
+        mode: "0600"
+
+    - name: Extract runtime config
+      ansible.builtin.unarchive:
+        src: "{{ _rc_tmp.path }}/config.tar.gz"
+        dest: "{{ _rc_tmp.path }}"
+        remote_src: true
+
+    - name: Check environment config file exists
+      ansible.builtin.stat:
+        path: "{{ _rc_tmp.path }}/{{ _rc_env_prefix }}-config.yml"
+      register: _rc_env_file
+
+    # 硬失败。文件被改名导致静默只用 defaults 部署，是凌晨三点才会被发现的那种 bug。
+    - name: Fail if environment config is missing from the tarball
+      ansible.builtin.fail:
+        msg: >-
+          {{ _rc_env_prefix }}-config.yml not found in
+          {{ _rc_service }}-{{ _rc_version }}.tar.gz. Check runtime_config_env_prefix
+          (defaults to config_environment) against the filenames in wbr-app-config.
+      when: not _rc_env_file.stat.exists
+
+    # ---- 分开读，不预先合并 ------------------------------------------------
+    - name: Read defaults.yml
+      ansible.builtin.slurp:
+        src: "{{ _rc_tmp.path }}/defaults.yml"
+      register: _rc_defaults_raw
+
+    - name: "Read {{ _rc_env_prefix }}-config.yml"
+      ansible.builtin.slurp:
+        src: "{{ _rc_tmp.path }}/{{ _rc_env_prefix }}-config.yml"
+      register: _rc_env_raw
+
+    - name: Parse both layers
+      ansible.builtin.set_fact:
+        _rc_defaults: "{{ _rc_defaults_raw.content | b64decode | from_yaml | default({}, true) }}"
+        _rc_envcfg: "{{ _rc_env_raw.content | b64decode | from_yaml | default({}, true) }}"
+
+    - name: Record group_vars values before override
+      ansible.builtin.set_fact:
+        _rc_before_jvm: "{{ environment_jvm_properties | default({}) }}"
+        _rc_before_env: "{{ environment_app_env_vars | default({}) }}"
+
+    # ---- 第 2 层：defaults.yml 垫在 group_vars 下面 -------------------------
+    # combine 的右边赢，所以这里把 group_vars 放右边 —— defaults 只填 group_vars
+    # 没定义的 app。
+    - name: "Layer 2: defaults.yml under group_vars (JVM_ARGS)"
+      ansible.builtin.set_fact:
+        environment_jvm_properties: >-
+          {{ {item.key: item.value.JVM_ARGS}
+             | combine(environment_jvm_properties | default({})) }}
+      loop: "{{ _rc_defaults | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.JVM_ARGS is defined
+
+    - name: "Layer 2: defaults.yml under group_vars (RUN_ARGS)"
+      ansible.builtin.set_fact:
+        environment_run_args: >-
+          {{ {item.key: item.value.RUN_ARGS}
+             | combine(environment_run_args | default({})) }}
+      loop: "{{ _rc_defaults | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.RUN_ARGS is defined
+
+    - name: "Layer 2: defaults.yml under group_vars (ENV_VARS)"
+      ansible.builtin.set_fact:
+        environment_app_env_vars: >-
+          {{ {item.key: item.value.ENV_VARS}
+             | combine(environment_app_env_vars | default({}), recursive=True) }}
+      loop: "{{ _rc_defaults | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.ENV_VARS is defined
+
+    # ---- 第 4 层：<env>-config.yml 压在 group_vars 上面 ---------------------
+    - name: "Layer 4: {{ _rc_env_prefix }}-config.yml over group_vars (JVM_ARGS)"
+      ansible.builtin.set_fact:
+        environment_jvm_properties: >-
+          {{ environment_jvm_properties | default({})
+             | combine({item.key: item.value.JVM_ARGS}) }}
+      loop: "{{ _rc_envcfg | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.JVM_ARGS is defined
+
+    - name: "Layer 4: {{ _rc_env_prefix }}-config.yml over group_vars (RUN_ARGS)"
+      ansible.builtin.set_fact:
+        environment_run_args: >-
+          {{ environment_run_args | default({})
+             | combine({item.key: item.value.RUN_ARGS}) }}
+      loop: "{{ _rc_envcfg | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.RUN_ARGS is defined
+
+    - name: "Layer 4: {{ _rc_env_prefix }}-config.yml over group_vars (ENV_VARS)"
+      ansible.builtin.set_fact:
+        environment_app_env_vars: >-
+          {{ environment_app_env_vars | default({})
+             | combine({item.key: item.value.ENV_VARS}, recursive=True) }}
+      loop: "{{ _rc_envcfg | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value.ENV_VARS is defined
+
+    - name: Runtime config applied
+      ansible.builtin.debug:
+        msg:
+          service: "{{ _rc_service }}"
+          version: "{{ _rc_version }}"
+          env_file: "{{ _rc_env_prefix }}-config.yml"
+          jvm_before: "{{ _rc_before_jvm }}"
+          jvm_after: "{{ environment_jvm_properties | default({}) }}"
+          env_vars_before: "{{ _rc_before_env }}"
+          env_vars_after: "{{ environment_app_env_vars | default({}) }}"
+          run_args_after: "{{ environment_run_args | default({}) }}"
+
+  always:
+    # 上面任何一步失败都会跑到这里，不会把带凭据拉下来的文件留在 /tmp。
+    - name: Clean up runtime config temp dir
+      ansible.builtin.file:
+        path: "{{ _rc_tmp.path }}"
+        state: absent
+      when: _rc_tmp is defined and _rc_tmp.path is defined
+```
+
+## 2. `wbr-app-config/wbr_wbrsvc-fraud-detection/defaults.yml`
+
+```yaml
+# WBR FRD — service 各环境运行时的通用值（优先级第 2 层）
+#
+# 优先级（低 -> 高）：
+#   1. gh-lib group_vars/all.yml
+#   2. 本文件                          <- 通用值
+#   3. gh-lib group_vars/<ENV>.yml     <- 环境特定，能盖过本文件
+#   4. 本目录的 <env>-config.yml       <- 最高
+#
+# 所以这里只放"不管哪个环境都一样"的值。任何按环境变的东西写进
+# <env>-config.yml —— 写在这里的话会被 group_vars/<ENV>.yml 盖掉。
+#
+# 必须跟 <env>-config.yml 一样按 app 名嵌套。
+# 这个文件必须存在（打包工具靠它识别 service 文件夹），但可以只有注释。
+
+Fraudster:
+  ENV_VARS:
+    LOG_PATH: /app/logs/WebLogs/webbroker-notification
+
+Solacer: {}
+
+Cleaner: {}
+
+Mailer: {}
+```
+
+## 3. `group_vars/all.yml` — 追加这段
+
+```yaml
+# ---- runtime config 注入的三个变量 ----
+# 只在这里声明为空，保证 fetch_runtime_config 不跑时模板也不会报 undefined。
+# 通用值请写在 wbr-app-config/<service>/defaults.yml（第 2 层，按 app 合并），
+# 不要写在这里 —— 一旦 <ENV>.yml 也定义同名变量，这里的内容会被整体丢弃。
+environment_jvm_properties: {}
+environment_run_args: {}
+environment_app_env_vars: {}
+
+# ---- runtime config tarball 坐标 ----
+runtime_config_service: wbr_wbrsvc-fraud-detection
+runtime_config_nexus_base: "{{ nexus_base_url }}/repository/application-managed-raw-3rd-party/W000WBR/ansible/app_runtime_config_params"
+runtime_config_version: "{{ lookup('ansible.builtin.env', 'RUNTIME_CONFIG_VERSION', default='') }}"
+```
+
+## 4. `group_vars/DEV_GH.yml` 和 `DEV.yml` — 替换掉第 26-27 行那两行注释草稿
+
+```yaml
+# ---- 环境特定运行参数（第 3 层）----
+# 只有 wbr-app-config/<service>/dev-config.yml 能盖过这里。
+# app-config 的 defaults.yml 是通用值，盖不过这里。
+environment_jvm_properties:
+  Fraudster: ["-Xms1024m", "-Xmx2048m"]
+  Solacer:   ["-Xms512m",  "-Xmx1024m"]
+  Cleaner:   ["-Xms512m",  "-Xmx1024m"]
+  Mailer:    ["-Xms512m",  "-Xmx1024m"]
+
+environment_app_env_vars:
+  Fraudster:
+    SPRING_PROFILES_ACTIVE: dev
+  Solacer: {}
+  Cleaner: {}
+  Mailer: {}
+
+environment_run_args: {}
+```
+
+## 5. `group_vars/PAT.yml` — 同结构换值
+
+```yaml
+environment_jvm_properties:
+  Fraudster: ["-Xms2048m", "-Xmx4096m"]
+  Solacer:   ["-Xms1024m", "-Xmx2048m"]
+  Cleaner:   ["-Xms1024m", "-Xmx2048m"]
+  Mailer:    ["-Xms1024m", "-Xmx2048m"]
+
+environment_app_env_vars:
+  Fraudster:
+    SPRING_PROFILES_ACTIVE: pat
+  Solacer: {}
+  Cleaner: {}
+  Mailer: {}
+
+environment_run_args: {}
+```
+
+## 6. `group_vars/PRD.yml` — 除了上面那段，还要处理文件名对不上
+
+task 用 `config_environment` 拼文件名，group_vars 叫 `PRD` 但 app-config 里是 `prod-config.yml`。二选一：
+
+```yaml
+# 办法 A：保留 prd，显式指定前缀
+config_environment: prd
+runtime_config_env_prefix: prod
+```
+
+```yaml
+# 办法 B：直接让 config_environment 就是 prod
+config_environment: prod
+```
+
+`DRP.yml` 同理 —— app-config 里目前没有 `drp-config.yml`，要么补一个，要么给它设 `runtime_config_env_prefix` 指向该跟随的环境。
+
+四个 app 在每个环境文件里都要列全 —— 因为 `all.yml` 和 `<ENV>.yml` 之间是**整体替换**不是合并，漏写一个那个 app 就没有值了。
