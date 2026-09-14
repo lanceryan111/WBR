@@ -1,0 +1,34 @@
+# wbr_wbrsvc-fraud-detection / defaults.yml
+#
+# 所有环境共用的部分。<env>-config.yml 会 deep-merge 到这上面。
+# 只放真正跨环境不变的东西；堆大小、profile 这种按环境变的放 <env>-config.yml。
+
+Fraudster:
+  JVM_ARGS:
+    - "-Xms512m"
+    - "-Xmx1024m"
+    - "-Dobjectgrid.client.props=/app/webAS/config/Fraudster/client.properties"
+  ENV_VARS:
+    TZ: America/Toronto
+    LOG_PATH: /app/logs/Fraudster
+
+Solacer:
+  JVM_ARGS:
+    - "-Xms256m"
+    - "-Xmx512m"
+  ENV_VARS:
+    TZ: America/Toronto
+
+Cleaner:
+  JVM_ARGS:
+    - "-Xms256m"
+    - "-Xmx512m"
+  ENV_VARS:
+    TZ: America/Toronto
+
+Mailer:
+  JVM_ARGS:
+    - "-Xms256m"
+    - "-Xmx512m"
+  ENV_VARS:
+    TZ: America/Toronto
