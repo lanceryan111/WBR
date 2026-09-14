@@ -1,0 +1,12 @@
+# ---- runtime config 注入的三个变量 ----
+# 只在这里声明为空，保证 fetch_runtime_config 不跑时模板也不会报 undefined。
+# 通用值请写在 wbr-app-config/<service>/defaults.yml（第 2 层，按 app 合并），
+# 不要写在这里 —— 一旦 <ENV>.yml 也定义同名变量，这里的内容会被整体丢弃。
+environment_jvm_properties: {}
+environment_run_args: {}
+environment_app_env_vars: {}
+
+# ---- runtime config tarball 坐标 ----
+runtime_config_service: wbr_wbrsvc-fraud-detection
+runtime_config_nexus_base: "{{ nexus_base_url }}/repository/application-managed-raw-3rd-party/W000WBR/ansible/app_runtime_config_params"
+runtime_config_version: "{{ lookup('ansible.builtin.env', 'RUNTIME_CONFIG_VERSION', default='') }}"
