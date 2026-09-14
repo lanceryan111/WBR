@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+[[ -n "$DEBUG" ]] && set -x
+
+{# per-app runtime config. group_vars supply the defaults; tasks/fetch_runtime_config.yml
+   (tag: runtime_config) overrides them from the Nexus tarball. Missing app key -> fallback. #}
+{% set _app = deploy_app_details.name %}
+{% set _jvm_args = (environment_jvm_properties | default({})).get(_app, ['-Xms2048m', '-Xmx2048m']) %}
+{% set _run_args = (environment_run_args | default({})).get(_app, []) %}
+{% set _env_vars = (environment_app_env_vars | default({})).get(_app, {}) %}
+export JARFILE={{ app_folders.app_deployment }}/{{ deploy_app_details.nexus_gav_binary.artifact_id }}.{{ deploy_app_details.nexus_gav_binary.extension }}
+export SERVICE_ACCOUNT={{ service_account }}
+export LOG_LOCATION={{ app_folders.logs }}/{{ deploy_app_details.name }}
+export RC_LOG_PATH="${LOG_LOCATION}/{{ deploy_app_details.nexus_gav_binary.artifact_id }}_rc.txt"
+export CONFIG_DIRECTORY={{ app_folders.config }}/{{ deploy_app_details.name }}
+export STARTUP_LOG_FILE_NAME="{{ deploy_app_details.name }}-Startup-$(hostname).log"
+
+# ======== APP ENV VARS ========
+{% for _k, _v in _env_vars | dictsort %}
+export {{ _k }}="{{ _v }}"
+{% endfor %}
+
+# ======== JAVA OPTIONS ========
+export JAVA_OPTS="{{ _jvm_args | join(' ') }} -XX:+CrashOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${LOG_LOCATION} -Dspring.config.additional-location=${CONFIG_DIRECTORY}/bootstrap.properties -Dlogging.file.path=${LOG_LOCATION}"
+
+export RUN_ARGS="{{ _run_args | join(' ') }}"
+
+su "${SERVICE_ACCOUNT}" -c "sh -c '/usr/bin/java $JAVA_OPTS -jar ${JARFILE} $RUN_ARGS > ${LOG_LOCATION}/${STARTUP_LOG_FILE_NAME} 2>&1; echo \$?'" > "${RC_LOG_PATH}"
+EXIT_CODE=$(cat "${RC_LOG_PATH}")
+echo "Application Exit with code ${EXIT_CODE}"
+exit "${EXIT_CODE}"
