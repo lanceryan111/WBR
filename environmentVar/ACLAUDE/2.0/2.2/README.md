@@ -1,3 +1,36 @@
+这个参考例子很有用，它是你们的**既有家规**，我们的方案有几处应该往上靠。先把它教的东西拆出来：
+
+**1. tarball 用完整 URL 引用，不是我造的那套「service 名 + LATEST 标记 + 拼路径」。**
+图1 里 `wbrcore_springboot_application_config_packages` 直接就是一个 Nexus URL 列表，按环境写在 `vars/DEV.yml` 里。这比我的 LATEST 机制简单得多，而且版本锁定天然就在 URL 里。**如果采用，我上一版的 LATEST 标记文件（含 `upload_app_config.py` 里写 LATEST 那段）整个可以删掉。**
+
+**2. 已经有现成的下载器 `extract_archive_nexus.yml`，比我写的好。**
+图5 说它会查 Nexus REST 拿 sha256、跟磁盘上已有的 `.sha256` 比对、**只有变了才重新部署**。我那套 `uri` + `get_url` + `unarchive` 没有幂等性，每次都重下。应该直接复用它。
+
+**3. 合并语义：dict 递归 combine，list 用 `+` 拼接。**
+图2 第 23-24 行 `ssl_certificates` / `config_packages` 是 `common + env` **拼接**，不是替换。这跟我对 `JVM_ARGS` 做的「按 app 整体替换」不一样。考虑到你说 defaults 和 env 内容不重叠，拼接其实更合适 —— `defaults.yml` 放 `-Dobjectgrid.client.props=...`，`dev-config.yml` 放 `-Xms256m -Xmx512m`，拼起来正好。
+
+**4. `include_vars` 带 `name:` 装进命名空间**（`common_config` / `environment_specific_config`），不污染全局变量。比我的 `slurp` + `from_yaml` 干净。
+
+**5. `set_stats` + `per_host: false`** 把合并结果传给 workflow 里的下一个 playbook。
+
+---
+
+不过有两处**不能照抄**，我得先说明白：
+
+**`extract_archive_nexus.yml` 解压到的是目标机的 `config_dir`,那是给 app 自己读的配置文件。** 我们的场景不一样 —— `JVM_ARGS` 必须进 `java` 命令行，app 运行时读文件是拿不到的，所以它**必须**变成 Ansible 变量。这意味着复用了下载器之后，仍然要有一步把解压出来的 YAML 读进 Ansible。而 `include_vars` 是从**控制节点**读的，文件在目标机上，所以这一步还是得 `slurp`（除非改成在控制节点解压）。
+
+**这两个 role 的架构是两代。** 参考的 `wbnzl-wealthbenzinga` 是 `playbooks/00-setup_vars.yml` + `vars/all.yml` + `vars/DEV.yml`；我们的 `wbr_wbrsvc-fraud-detection` 是 `deployment.yml` + `group_vars/` + `tasks/`。一个用 `vars/` 一个用 `group_vars/`,playbook 也没拆号。
+
+---
+
+等你下一批图，我主要想确认三件事：
+
+1. **`extract_archive_nexus.yml` 的完整内容** —— 它的入参（`wbrcore_springboot_application_archive_package` / `..._deployment_path`）、解压到哪、是不是 `delegate_to` 控制节点。这决定我们是复用它还是只借鉴它的 sha256 幂等思路。
+2. **图1 第 22 行 `wbrcore_springboot_application_external_config_url` 后面怎么被消费的** —— 它是新加的（高亮那行），跟 `config_packages` 走的是不是同一条路。如果它就是为「外部配置变成 Ansible 变量」设计的，那我们直接用它，方案能省掉一大半。
+3. **fraud-detection 要不要迁到 `wbnzl-wealthbenzinga` 那套结构** —— 还是只借配置合并的思路，保持现在的 `deployment.yml` + `group_vars/`。这个决定改动范围差很多。
+
+在这之前我先不动代码，免得白改。
+
 图1-3 的链路我对照了，**是对的**，补两处细节：
 
 | 环节 | 文件 | 确认 |
