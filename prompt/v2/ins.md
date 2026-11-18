@@ -239,3 +239,28 @@ Visual Studio Code
 我可以帮你做一次 Instruction Audit，重点检查重复规则、冲突、过度约束、缺少可验证的执行步骤，以及哪些规则应该放在 Global Instructions、哪些应该移到 RCA Workflow。
 
 这样比继续盲目增加规则，更有机会真正改善现有模型的代码理解和 Troubleshooting 表现。
+
+2. 最推荐的修改：精简 Global Instructions
+我建议把 ~/.copilot/copilot-instructions.md 中关于完整 RCA、全面检查依赖、验证所有环境等要求移到专用 Prompt。
+
+Global 只保留：
+
+# Global Engineering Instructions
+
+- Follow existing repository conventions.
+- Read directly relevant code before proposing changes.
+- Prefer minimal and targeted modifications.
+- Do not invent variables, APIs, configuration, or test results.
+- Distinguish verified facts from assumptions.
+- Avoid repeating identical searches or file reads without a new question.
+- If two consecutive investigation steps provide no new evidence, stop expanding the search and summarize findings.
+- Do not run destructive commands or modify production systems without approval.
+- Match investigation depth to task complexity.
+
+
+
+这里最重要的是最后一条：
+
+Match investigation depth to task complexity.
+
+模型解释一个 YAML 变量，不应该被迫调查整个 Repository
